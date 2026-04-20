@@ -1,6 +1,6 @@
 # W&B Integration Reference
 
-> **Code version**: `3e60c47` (2026-03-31, `main`)
+> **Code version**: `0b55a9e` (2026-04-20, `feat/wandb-optional-by-default`)
 > **PyTorch**: see `requirements.txt` · **Lightning**: see `requirements.txt`
 > **Tracking**: #252, #263
 
@@ -18,14 +18,15 @@ ______________________________________________________________________
 
 ## 1. Initialization
 
-| Concern           | How it works                                                                                                   | File                              |
-| ----------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| W&B run creation  | `WandbLogger` instantiated by Hydra                                                                            | `configs/logger/wandb.yaml`       |
-| Entity / project  | Env-var driven: `entity: "${oc.env:WANDB_ENTITY,tinaudio}"`, `project: "${oc.env:WANDB_PROJECT,synth-setter}"` | `configs/logger/wandb.yaml:10,13` |
-| Run ID            | `null` (W&B auto-generates)                                                                                    | `configs/logger/wandb.yaml:8`     |
-| Checkpoint upload | `log_model: "all"`                                                                                             | `configs/logger/wandb.yaml:11`    |
-| Code saving       | `wandb.Settings(code_dir=".")`                                                                                 | `configs/logger/wandb.yaml:17-19` |
-| Run teardown      | `wandb.finish()` in `task_wrapper` finally block                                                               | `src/utils/utils.py:102-107`      |
+| Concern           | How it works                                                                                             | File                               |
+| ----------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| W&B run creation  | `WandbLogger` instantiated by Hydra — opt-in via `logger=wandb` (the default `many_loggers` is CSV + TB) | `configs/logger/wandb.yaml`        |
+| Entity / project  | Env-var driven: `entity: ${oc.env:WANDB_ENTITY,null}`, `project: "${oc.env:WANDB_PROJECT,synth-setter}"` | `configs/logger/wandb.yaml:10,13`  |
+| Default compose   | `many_loggers` composes `csv + tensorboard` (W&B excluded by default)                                    | `configs/logger/many_loggers.yaml` |
+| Run ID            | `null` (W&B auto-generates)                                                                              | `configs/logger/wandb.yaml:8`      |
+| Checkpoint upload | `log_model: "all"`                                                                                       | `configs/logger/wandb.yaml:11`     |
+| Code saving       | `wandb.Settings(code_dir=".")`                                                                           | `configs/logger/wandb.yaml:17-19`  |
+| Run teardown      | `wandb.finish()` in `task_wrapper` finally block                                                         | `src/utils/utils.py:102-107`       |
 
 **No direct `wandb.init()` calls exist in runtime code.** One `wandb.config.update()` call exists: `log_wandb_provenance()` in `src/utils/logging_utils.py:91` writes provenance metadata (see [2g](#2g-provenance-metadata-logged-once-at-run-start)).
 
@@ -159,13 +160,13 @@ ______________________________________________________________________
 
 ## 5. Known Gaps
 
-| #   | Gap                                                                                                                                                                                  | Impact                                                                                              | Tracking |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | -------- |
-| 1   | ~~**Entity/project hardcoded** to `benhayes`/`synth-permutations`~~ **RESOLVED** — now env-var driven (`WANDB_ENTITY`/`WANDB_PROJECT`), defaults `tinaudio`/`synth-setter`           | ~~Runs log to wrong account~~                                                                       | #133     |
-| 2   | **No `wandb.config` for env vars** — W&B captures `sys.argv` but not env vars like `TRAINING_ARGS`. **Partially resolved:** `IMAGE_TAG` is now captured by `log_wandb_provenance()`. | Config passed via env vars is silently missing from W&B (except `IMAGE_TAG`)                        | #252     |
-| 3   | ~~**No `github_sha` in `wandb.config`**~~ **RESOLVED** — `log_wandb_provenance()` now logs `github_sha` via `git rev-parse HEAD`                                                     | ~~Can't reliably link a run to the exact code that produced it~~                                    | —        |
-| 4   | **No GitHub issue integration** — train job doesn't post run ID back to GitHub                                                                                                       | Manual lookup to match runs to issues                                                               | #263     |
-| 5   | ~~**`log_model: true` vs `"all"`**~~ **RESOLVED** — changed to `log_model: "all"` for crash resilience (every checkpoint uploaded immediately)                                       | —                                                                                                   | —        |
-| 6   | **Visualization callbacks use `wandb.log()` directly** — bypasses Lightning logger abstraction                                                                                       | Breaks if logger is swapped; step alignment relies on `trainer.global_step`                         | —        |
-| 7   | **`torch.compile` crashes test-stage `setup()`** — eval after training fails                                                                                                         | Post-training test metrics never logged to W&B                                                      | #248     |
-| 8   | **No structured run ID convention** — `id: null` means W&B generates random IDs                                                                                                      | Can't reconstruct run lineage from ID alone; design doc specifies `{config_id}-{timestamp}` pattern | —        |
+| #   | Gap                                                                                                                                                                                                                           | Impact                                                                                              | Tracking |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------- |
+| 1   | ~~**Entity/project hardcoded** to `benhayes`/`synth-permutations`~~ **RESOLVED** — env-var driven (`WANDB_ENTITY`/`WANDB_PROJECT`); entity defaults to `null` (user's W&B default entity), project defaults to `synth-setter` | ~~Runs log to wrong account~~                                                                       | #133     |
+| 2   | **No `wandb.config` for env vars** — W&B captures `sys.argv` but not env vars like `TRAINING_ARGS`. **Partially resolved:** `IMAGE_TAG` is now captured by `log_wandb_provenance()`.                                          | Config passed via env vars is silently missing from W&B (except `IMAGE_TAG`)                        | #252     |
+| 3   | ~~**No `github_sha` in `wandb.config`**~~ **RESOLVED** — `log_wandb_provenance()` now logs `github_sha` via `git rev-parse HEAD`                                                                                              | ~~Can't reliably link a run to the exact code that produced it~~                                    | —        |
+| 4   | **No GitHub issue integration** — train job doesn't post run ID back to GitHub                                                                                                                                                | Manual lookup to match runs to issues                                                               | #263     |
+| 5   | ~~**`log_model: true` vs `"all"`**~~ **RESOLVED** — changed to `log_model: "all"` for crash resilience (every checkpoint uploaded immediately)                                                                                | —                                                                                                   | —        |
+| 6   | **Visualization callbacks use `wandb.log()` directly** — bypasses Lightning logger abstraction                                                                                                                                | Breaks if logger is swapped; step alignment relies on `trainer.global_step`                         | —        |
+| 7   | **`torch.compile` crashes test-stage `setup()`** — eval after training fails                                                                                                                                                  | Post-training test metrics never logged to W&B                                                      | #248     |
+| 8   | **No structured run ID convention** — `id: null` means W&B generates random IDs                                                                                                                                               | Can't reconstruct run lineage from ID alone; design doc specifies `{config_id}-{timestamp}` pattern | —        |
