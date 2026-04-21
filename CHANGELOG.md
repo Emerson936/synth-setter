@@ -1,6 +1,154 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-04-21)
+
+### Documentation
+
+- Add contributor-facing testing primer ([#651](https://github.com/tinaudio/synth-setter/pull/651),
+  [`18f45d2`](https://github.com/tinaudio/synth-setter/commit/18f45d25e724c304ef3b0f544130ccac060152d1))
+
+* docs: add contributor-facing testing primer
+
+Add docs/reference/testing.md covering the bare minimum contributors need to read a test in this
+  repo and write a new one — layout, conftest fixtures, pytest markers, the train→eval e2e pattern,
+  and six gotchas distilled from recent review cycles (DataModule setup(stage) semantics, cfg_eval
+  diverging from cfg_train, limit_val_batches parity, GPU marker stack, weights_only=False,
+  mode→stage audit when extending eval.py).
+
+Link from docs/getting-started.md §2f so contributors discover the primer right after they verify
+  the install.
+
+Scope is deliberately small (≤1 page, ~5 min read) to keep the doc from rotting. Per-test docs and
+  ML-test theory are intentionally out of scope.
+
+Closes #650.
+
+* docs: rewrite testing primer to reference sources instead of echoing values
+
+Two corrections surfaced in PR review:
+
+1. Drift risk — the primer hardcoded marker lists, Makefile flags, fixture preset values, and CI
+  selector strings. Copilot caught four cases where those values didn't match reality
+  (tests/test_instantiators.py doesn't exist, make test uses -n auto -m 'not slow and not
+  requires_vst', cfg_eval has no limit_train_batches preset either, GPU CI uses -m gpu not -m 'slow
+  and gpu'). The root cause is the pattern: if the doc echoes code, it has to be re-synced on every
+  code change.
+
+2. Category bias — the previous version treated the repo as Hydra+Lightning e2e tests plus a few
+  sibling files. Actually tests/ has pipeline tests (own conftest), property-based tests,
+  benchmarks, sweep tests, script tests, docker smoke tests, and VST-gated integration tests. The
+  primer didn't mention them, so a reader got a warped picture of the suite.
+
+Rewrite: - §1 now catalogs all 10 test categories with links to a representative file for each (no
+  file enumeration in prose). - §2 (invocation) defers to the Makefile and .github/workflows/ rather
+  than copying their flags. Explicitly warns that CI and make selectors aren't identical. - §3 is
+  new — a 'which shape fits your test' table keyed on goal, so a reader picks the right template
+  before writing. - §4 (fixtures) describes the cfg_train/cfg_eval asymmetry structurally ('cfg_eval
+  presets a subset') without naming specific keys. - §5 keeps the E2E Python template (the one
+  hardcoded value that's genuinely the point of the primer — the shape), but explicitly notes that
+  non-E2E categories should NOT copy it. - §6 gotchas reworded to point at source files; gotcha #4
+  no longer asserts the CI selector string. - §7 pointers expanded with pipeline conftest, Makefile,
+  CI workflow directory, and the pyproject.toml marker registry.
+
+Addresses Copilot comments r3113275967, r3113276012, r3113276033, r3113276057.
+
+Refs #650.
+
+* docs: teach math.isfinite in the canonical E2E template
+
+The train→eval E2E template in the testing primer had `assert eval_metric_dict["val/loss"] <
+  float("inf")`. That idiom silently accepts `-inf` (since `-inf < +inf` is True). The template is
+  explicitly the pattern new contributors copy-paste, so teaching `< float("inf")` here would
+  propagate the subtle correctness gap to every future E2E test in this repo.
+
+Swap to `math.isfinite(metric.item())` to match the tightened assertions in #655, which refits both
+  `test_train_eval` and `test_train_validate` on main. Also adds an inline comment explaining the
+  gotcha, since it's non-obvious why the stricter form matters for MSE-style losses.
+
+Refs #650, refs #655.
+
+* docs: address round 2 review on testing primer
+
+- §1: correct the pipeline conftest claim — parent conftests ARE resolved by pytest, so
+  cfg_train/cfg_eval are reachable under tests/pipeline/; pipeline tests just don't lean on them. -
+  §2: fix CI workflow bullet descriptions — test-conda.yml is a single micromamba env run (not a
+  matrix); nightly.yml is a full pytest run on CPU (not an expensive-only suite). - §5: replace
+  invalid placeholder test_train_<what>(...) with a valid identifier test_train_e2e and a rename
+  hint; snippet now copy-pastes without a SyntaxError.
+
+### Features
+
+- **scripts**: Click-based docker entrypoint with per-mode spec parsing
+  ([#645](https://github.com/tinaudio/synth-setter/pull/645),
+  [`6402042`](https://github.com/tinaudio/synth-setter/commit/6402042a8f35304fd314aec56f152acf4b4ac040))
+
+Rewrites scripts/docker_entrypoint.py as a click group with five subcommands (idle, passthrough,
+  generate_dataset, render_eval, train). Each spec-taking subcommand deserializes its --spec into a
+  mode-specific pydantic model at the container boundary (parse-don't-validate) before handing off
+  to the downstream.
+
+pipeline/entrypoints/generate_dataset.py collapses to a single run(spec: DatasetPipelineSpec)
+  function. Env-var reads (DATASET_CONFIG, R2_BUCKET, RUN_METADATA_DIR) are deleted; the __main__
+  block fails loudly pointing callers at the new entrypoint.
+
+DatasetConfig gains a required r2_bucket field (mirrored into DatasetPipelineSpec via
+  materialize_spec). run_metadata_dir is dropped everywhere — in the new flow the host materializes
+  the spec and passes it via --spec, so the container never needs to write the spec out via bind
+  mount.
+
+This breaks MODE=generate_dataset callers of the bash entrypoint. #647 will swap the Dockerfile
+  ENTRYPOINT to the Python CLI and update workflows; deploy #645 and #647 back-to-back.
+
+Deferred follow-ups (filed alongside this PR): - Spec content-addressing / hashing
+  (s3://bucket/specs/<sha256>.json) - Structured error output for pydantic ValidationError in logs -
+  Exit-code retry/don't-retry contract for orchestrator consumers - URI-based spec resolution
+  (--spec s3://...) - Rename #410 eval → render_eval and propagate through docs
+
+### Monitoring
+
+- Route plot callbacks through Lightning loggers
+  ([#646](https://github.com/tinaudio/synth-setter/pull/646),
+  [`f830781`](https://github.com/tinaudio/synth-setter/commit/f830781148cfc89bc9f2a9c8b08a4bb2340ce8eb))
+
+* fix(monitoring): route plot callbacks through Lightning loggers
+
+Replace direct wandb.log / wandb.Image calls in the three plot callbacks (PlotLossPerTimestep,
+  PlotPositionalEncodingSimilarity, PlotLearntProjection) with a small _log_figure helper that
+  dispatches per-logger across trainer.loggers. The helper calls log_image on WandbLogger and
+  experiment.add_figure on TensorBoardLogger, and silently skips loggers with no image API (e.g.
+  CSVLogger). This removes the W&B auth-prompt bypass that survived #612's opt-in switch and lets
+  plots land on whichever logger the user actually selected.
+
+Closes #614
+
+* docs(monitoring): update wandb-integration.md for Lightning logger dispatch
+
+The callback dispatch refactor replaces direct wandb.log() / wandb.Image() calls with a per-logger
+  dispatcher. Update §Overview, §2c, the PredictionWriter row in §2d, and mark Known Gap #6 as
+  resolved (tracked by #614).
+
+Refs #614
+
+* fix(monitoring): guard _log_figure with rank-zero check for DDP safety
+
+TensorBoard's SummaryWriter is not rank-safe and W&B's log_image from non-zero ranks can duplicate
+  figures. Early-return from _log_figure unless trainer.is_global_zero. Added
+  test_log_figure_is_noop_on_non_zero_rank.
+
+* docs(monitoring): clarify _log_figure silent-skip intent
+
+Expand the docstring to explain that skipping non-image-capable loggers (CSVLogger today) is
+  intentional, and direct future contributors to add an isinstance branch here if an
+  MLflow/Comet/Neptune logger is introduced.
+
+* docs(monitoring): replace brittle line numbers with symbol refs in callbacks table
+
+Line-number references in §2c and §2d of wandb-integration.md shifted twice during this PR (after
+  the rank-zero guard and after the docstring expansion). Switch to stable Python-symbol references
+  (\`src/utils/callbacks.py::Class.method\`) so future callback refactors don't drift these rows.
+
+
 ## v0.3.0 (2026-04-20)
 
 ### Documentation
