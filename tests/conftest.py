@@ -25,30 +25,34 @@ def cfg_train_global() -> DictConfig:
     :return: A DictConfig object containing a default Hydra configuration for training.
     """
     with initialize(version_base="1.3", config_path="../configs"):
-        cfg = compose(config_name="train.yaml", return_hydra_config=True, overrides=[])
+        cfg = compose(
+            config_name="train.yaml",
+            return_hydra_config=True,
+            overrides=["data=ksin", "model=ffn", "trainer=cpu"],
+        )
 
         # set defaults for all tests
         with open_dict(cfg):
-            cfg.paths.root_dir = str(rootutils.find_root(indicator=".project-root"))
-            cfg.trainer.max_epochs = 1
-            cfg.trainer.min_steps = None
-            # Lightning 2.x uses ``-1`` as the sentinel for "unbounded" max_steps;
-            # passing ``None`` triggers an internal ``None < int`` comparison. We
-            # want the epoch-based ``max_epochs=1`` to drive termination.
-            cfg.trainer.max_steps = -1
-            cfg.trainer.val_check_interval = None
+            # Trainer defaults
             cfg.trainer.check_val_every_n_epoch = 1
-            cfg.trainer.limit_train_batches = 0.01
-            cfg.trainer.limit_val_batches = 0.1
-            cfg.trainer.limit_test_batches = 0.1
-            cfg.trainer.accelerator = "cpu"
+            cfg.trainer.val_check_interval = 1
+            cfg.trainer.max_epochs = 1
+            cfg.trainer.num_sanity_val_steps = 0
+            cfg.trainer.log_every_n_steps = 1
             cfg.trainer.devices = 1
+            cfg.trainer.deterministic = True
+            # DataLoader defaults
             cfg.data.num_workers = 0
             cfg.data.pin_memory = False
-            cfg.extras.print_config = False
-            cfg.extras.enforce_tags = False
+            cfg.data.batch_size = 1
+            cfg.data.train_val_test_sizes = [2, 2, 2]
+            cfg.data.break_symmetry = True
+            # Other defaults
             cfg.model.compile = False
             cfg.logger = None
+            cfg.paths.root_dir = str(rootutils.find_root(indicator=".project-root"))
+            cfg.callbacks.model_checkpoint.save_top_k = -1
+            cfg.callbacks.model_checkpoint.save_last = True
             callbacks = cfg.get("callbacks")
             if callbacks is not None and "lr_monitor" in callbacks:
                 del callbacks.lr_monitor
@@ -63,31 +67,37 @@ def cfg_eval_global() -> DictConfig:
     :return: A DictConfig containing a default Hydra configuration for evaluation.
     """
     with initialize(version_base="1.3", config_path="../configs"):
-        cfg = compose(config_name="eval.yaml", return_hydra_config=True, overrides=["ckpt_path=."])
+        cfg = compose(
+            config_name="eval.yaml",
+            return_hydra_config=True,
+            overrides=[
+                "data=ksin",
+                "model=ffn",
+                "trainer=cpu",
+                "ckpt_path=.",
+            ],
+        )
 
         # set defaults for all tests
         with open_dict(cfg):
-            cfg.paths.root_dir = str(rootutils.find_root(indicator=".project-root"))
-            cfg.trainer.max_epochs = 1
-            cfg.trainer.min_steps = None
-            # Lightning 2.x uses ``-1`` as the sentinel for "unbounded" max_steps;
-            # passing ``None`` triggers an internal ``None < int`` comparison. We
-            # want the epoch-based ``max_epochs=1`` to drive termination.
-            cfg.trainer.max_steps = -1
-            cfg.trainer.val_check_interval = None
+            # Trainer defaults
             cfg.trainer.check_val_every_n_epoch = 1
-            cfg.trainer.limit_test_batches = 0.1
-            cfg.trainer.accelerator = "cpu"
+            cfg.trainer.val_check_interval = 1
+            cfg.trainer.max_epochs = 1
+            cfg.trainer.num_sanity_val_steps = 0
+            cfg.trainer.log_every_n_steps = 1
             cfg.trainer.devices = 1
+            cfg.trainer.deterministic = True
+            # DataLoader defaults
             cfg.data.num_workers = 0
             cfg.data.pin_memory = False
-            cfg.extras.print_config = False
-            cfg.extras.enforce_tags = False
+            cfg.data.batch_size = 1
+            cfg.data.train_val_test_sizes = [2, 2, 2]
+            cfg.data.break_symmetry = True
+            # Other defaults
+            cfg.model.compile = False
             cfg.logger = None
-            callbacks = cfg.get("callbacks")
-            if callbacks is not None and "lr_monitor" in callbacks:
-                del callbacks.lr_monitor
-
+            cfg.paths.root_dir = str(rootutils.find_root(indicator=".project-root"))
     return cfg
 
 
@@ -104,7 +114,6 @@ def cfg_train(cfg_train_global: DictConfig, tmp_path: Path) -> DictConfig:
     :return: A DictConfig with updated output and log directories corresponding to `tmp_path`.
     """
     cfg = cfg_train_global.copy()
-
     with open_dict(cfg):
         cfg.paths.output_dir = str(tmp_path)
         cfg.paths.log_dir = str(tmp_path)
@@ -121,7 +130,7 @@ def cfg_eval(cfg_eval_global: DictConfig, tmp_path: Path) -> DictConfig:
 
     This is called by each test which uses the `cfg_eval` arg. Each test generates its own temporary logging path.
 
-    :param cfg_train_global: The input DictConfig object to be modified.
+    :param cfg_eval_global: The input DictConfig object to be modified.
     :param tmp_path: The temporary logging path.
 
     :return: A DictConfig with updated output and log directories corresponding to `tmp_path`.
