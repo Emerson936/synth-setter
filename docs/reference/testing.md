@@ -38,11 +38,14 @@ All common selectors are defined as Makefile targets — read [`Makefile`](../..
 
 CI selectors live in [`.github/workflows/`](../../.github/workflows):
 
-- [`test.yml`](../../.github/workflows/test.yml) — CPU tests on every PR.
-- [`test-gpu.yml`](../../.github/workflows/test-gpu.yml) — GPU-gated tests on a GPU runner.
-- [`test-expensive.yml`](../../.github/workflows/test-expensive.yml) — slow (non-GPU) pytest suite, post-merge on `main`.
+- [`test.yml`](../../.github/workflows/test.yml) — fast CPU tests on every PR (`-m "not slow and not gpu and not mps"`).
+- [`test-gpu.yml`](../../.github/workflows/test-gpu.yml) — GPU-marked tests on a GPU runner. Twice-weekly cron + manual dispatch.
+- [`test-mps.yml`](../../.github/workflows/test-mps.yml) — MPS-marked tests on a `macos-latest` (Apple Silicon) runner. Triggered on push to `main` **and** on PRs that touch `src/` or `configs/` — the closest thing to pre-submit coverage for slow Surge tests, since the macOS runner is large enough to host the FFN forward pass without OOM.
+- [`test-expensive.yml`](../../.github/workflows/test-expensive.yml) — slow non-GPU, non-MPS suite (`-m "slow and not gpu and not mps"`), post-merge on `main`. **Post-merge by design**: PyTorch CPU forward passes OOM the standard 2-core PR runner. The lane is sized to avoid that (see the workflow's `runs-on:` for the current label) and runs after merge so PR feedback isn't gated on it. PR-time coverage of these tests comes from `test-mps.yml`.
 - [`test-conda.yml`](../../.github/workflows/test-conda.yml) — single conda-env run (micromamba from `environment.yaml`) on `ubuntu-latest`; covers the non-slow suite under the locked conda deps.
 - [`nightly.yml`](../../.github/workflows/nightly.yml) — scheduled full `pytest` run on CPU (`ubuntu-latest`); no marker filter, so GPU-gated tests skip via `RunIf`.
+
+**Coverage strategy in one sentence:** `[cpu]` parametrizations of slow tests run post-merge on the large runner (`test-expensive.yml`); `[mps]` parametrizations run pre-submit on the macOS runner (`test-mps.yml`); `[gpu]` parametrizations run twice-weekly on the GPU runner (`test-gpu.yml`). A regression in the cpu path is caught after merge, not before — accepted because the cost of running CPU PyTorch on every PR is OOM failures, not just minutes.
 
 CI and `make` selectors are **not identical** — CI may use different marker combinations to partition work across runners. Source of truth is always the file, not this doc.
 
@@ -76,6 +79,8 @@ Both defined in [`tests/conftest.py`](../../tests/conftest.py) as package-scoped
 `cfg_train_global` and `cfg_eval_global` compose with the **same** `data=ksin model=ffn trainer=cpu` overrides, and dataset shape is pinned via integer `train_val_test_sizes=[2,2,2]` rather than fractional `limit_*_batches`. A train→eval round-trip no longer needs to copy `data` / `model` / `callbacks` from one config to the other.
 
 Both fixtures clear global Hydra state on teardown via `GlobalHydra.instance().clear()`.
+
+A third fixture group — `cfg_surge_xt_global` / `cfg_surge_xt` / `cfg_surge_xt_eval` — follows the same pattern for Surge XT FFN tests (`tests/test_train.py::test_train_surge_xt_*`). It composes `train.yaml` with `experiment=surge/ffn_full`, points at the 5-sample dataset generated on demand by the `surge_xt_smoke_datasets` fixture, and bakes in the smoke-test trainer knobs. `cfg_surge_xt_eval` is **not** built by composing `eval.yaml` — it's a copy of the train-side fixture (`cfg_surge_xt_global`) with `mode="predict"` set and `ckpt_path` pointed at the checkpoint the matching `cfg_surge_xt` run will write under the same `tmp_path`. This guarantees the evaluator sees the exact `data` / `model` shape that produced the checkpoint, with no `eval.yaml` / `train.yaml` reconciliation step. Read [`tests/conftest.py`](../../tests/conftest.py) for the current field-level overrides.
 
 ______________________________________________________________________
 
