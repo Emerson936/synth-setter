@@ -1,6 +1,95 @@
 # CHANGELOG
 
 
+## v0.6.2 (2026-04-30)
+
+### Bug Fixes
+
+- **ci**: Drop `passthrough` from docker run invocations after #721 dropped ENTRYPOINT
+  ([#727](https://github.com/tinaudio/synth-setter/pull/727),
+  [`c2a67cc`](https://github.com/tinaudio/synth-setter/commit/c2a67ccab86adb57217074cefa41449bc11a740d))
+
+#721 (commit 450cf0b) intentionally removed the click-CLI ENTRYPOINT from
+  docker/ubuntu22_04/Dockerfile to support SkyPilot's RunPod backend (which prepends `bash -c
+  '...'`) and changed CMD to /bin/bash. That broke the existing `passthrough <argv>` callers —
+  passthrough was a click subcommand of the now-absent ENTRYPOINT, so docker tried to exec the
+  literal `passthrough` and failed with "executable file not found in $PATH".
+
+Failing main run: https://github.com/tinaudio/synth-setter/actions/runs/25178840823
+
+With CMD=/bin/bash and no ENTRYPOINT, `docker run img <argv>` overrides CMD with <argv> directly, so
+  dropping the `passthrough` prefix runs the same commands unchanged. Matches the canonical
+  invocation already documented in tests/docker/test_smoke.py's docstring.
+
+Workflows fixed: - .github/workflows/docker-build-validation.yml — both smoke tests -
+  .github/workflows/spec-materialization.yml — materialize_spec dispatch
+
+Other workflows still using `passthrough` / click ENTRYPOINT subcommands remain broken and are
+  tracked in the linked issue: - .github/workflows/test-dataset-generation.yml -
+  .github/workflows/flush-investigation.yml - .github/workflows/dataset-generation.yml
+
+Refs #726
+
+### Build System
+
+- **deps**: Migrate lightning to pytorch_lightning (lightning quarantined on PyPI) + add docker deps
+  for skypilot ([#721](https://github.com/tinaudio/synth-setter/pull/721),
+  [`450cf0b`](https://github.com/tinaudio/synth-setter/commit/450cf0b05b9a6c516e4eea0e240fa2b335bb0bbd))
+
+* build(deps): migrate lightning to pytorch_lightning
+
+* build(docker): drop ENTRYPOINT, default CMD to /bin/bash, install sky deps
+
+SkyPilot's RunPod backend launches the pod with `dockerArgs: "bash -c '<base64-setup>'"`, so a
+  baked-in click-CLI ENTRYPOINT collides with the launcher. Drop ENTRYPOINT and default CMD to
+  /bin/bash so `docker run img` lands in a shell; callers invoke the click CLI explicitly.
+
+Install rsync, openssh-client, and python3-pip — SkyPilot needs the SSH toolchain to stage
+  file_mounts and shells out to a system `pip3` that the uv-managed venv at /venv/main does not
+  expose.
+
+Skip test_render_params_sets_preset_dependent_param on linux pending refactor to use
+  scripts/run-linux-vst-headless.sh.
+
+### Internal-Feat
+
+- **vst**: Add deterministic-render kwargs to make_dataset/generate_sample
+  ([#720](https://github.com/tinaudio/synth-setter/pull/720),
+  [`13bfc62`](https://github.com/tinaudio/synth-setter/commit/13bfc624b277ca9f966ac897a290e26324383c3c))
+
+* internal-feat(vst): add deterministic-render kwargs to make_dataset/generate_sample
+
+`generate_sample` accepts optional `fixed_synth_params` / `fixed_note_params` that take precedence
+  over `param_spec.sample()`, and `make_dataset` accepts `fixed_synth_params_list` /
+  `fixed_note_params_list` and indexes them per sample by `i - start_idx` after validating the lists
+  are long enough. The kwargs are internal-only on this PR — they exist so a later act of the #702
+  split (the `surge_xt_interactive.py` capture/replay flow) can render caller-supplied patches
+  deterministically. No public-facing surface changes.
+
+Refs #702 #719
+
+* internal-fix(vst): skip param_spec.sample() and bound retries when fully fixed
+
+Address two Copilot review comments on PR #720:
+
+1. (#3166554305) When both fixed_synth_params and fixed_note_params are supplied, skip the
+  param_spec.sample() call entirely. The previous code burned RNG state and paid the call overhead
+  on every retry even though the values were discarded — now param_spec.sample() only runs when at
+  least one half needs sampling.
+
+2. (#3166554339) When BOTH fixed dicts are supplied, render inputs are fully deterministic, so
+  retrying after a loudness fail is provably futile. Raise ValueError with a clear caller-actionable
+  message instead of looping forever. When only one half is fixed, the other is re-sampled each
+  retry and the loop remains meaningful.
+
+Per-item shape validation of fixed_note_params (suggested by #3166554364) is intentionally not added
+  — this is an internal-feat:, the caller is trusted to produce well-formed dicts (same trust
+  boundary as param_spec.sample()), and the existing KeyError on note_params['pitch'] is already
+  actionable.
+
+Refs #720 #719 #702
+
+
 ## v0.6.1 (2026-04-30)
 
 ### Bug Fixes
