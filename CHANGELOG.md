@@ -1,6 +1,82 @@
 # CHANGELOG
 
 
+## v0.7.0 (2026-04-30)
+
+### Features
+
+- **evaluation**: Apply model predictions to live Surge XT and record patches to dataset
+  ([#723](https://github.com/tinaudio/synth-setter/pull/723),
+  [`6977add`](https://github.com/tinaudio/synth-setter/commit/6977addcc204bcd04920b487a8188dec5ef7c3b9))
+
+* feat(evaluation): apply model predictions to live Surge XT and record patches to dataset
+
+Replace the 41-line surge_xt_interactive demo with a human-in-the-loop tool that loads predicted
+  parameters or dataset rows, opens the Surge XT editor for tweaking, captures snapshots (p to
+  record, q to quit), and renders recorded patches into a labeled HDF5 dataset via make_dataset's
+  fixed_synth_params_list kwarg (added in #720).
+
+Adds CPU-only unit tests for the row decoders and Click param-type parsers, plus a user guide under
+  docs/guides/.
+
+Runtime dependencies (#713 per-render plugin reload, #715 Darwin warmup skip, #720
+  deterministic-render kwargs) all already on main.
+
+Closes #701 Refs #720 Refs #532 Part of #529
+
+* docs(surge-xt-interactive): correct core.py symbol names and platform scope
+
+Fix three doc-drift findings flagged on PR #723:
+
+- The "0.5 s editor warm-up" bullet referenced `_prepare_plugin` and
+  `_PREPARE_PLUGIN_SLEEP_SECONDS`. Neither exists; the warmup is inlined in `load_plugin` and the
+  constant is `_EDITOR_INIT_DELAY_SECONDS`. - The same bullet treated the warmup as universal, but
+  it only runs on non-Darwin (`if sys.platform != "darwin":` in core.py) — macOS skips the warmup
+  entirely per the #714 SIGTRAP workaround. Scope the bullet accordingly and note that the post-load
+  `process(...)` flush in `render_params` is what commits preset state on macOS. - The
+  loudness-retry-loop bullet claimed "params don't change between retries" when `fixed_synth_params`
+  is set. Only synth params are held constant; note params are still re-sampled per retry. The
+  fully-fixed path raises `ValueError` instead, but this script never reaches that branch. Rewrote
+  the explanation; the user-visible workaround (only press `p` while you can hear the patch) is
+  unchanged.
+
+Also updates `docs/doc-map.yaml` to use the correct constant name and note the non-Darwin gating.
+
+Refs #701 Part of #529
+
+* fix(scripts): address copilot review on surge_xt_interactive
+
+Resolves four review comments on PR #723:
+
+- Replace two `assert` statements (audio shape check in `play_audio` and output shape check in
+  `play_audio_recorded`) with `raise ValueError`. `python -O` strips asserts, but these are runtime
+  invariants that must not be silently skipped. - Validate `batch_idx >= 0` in both
+  `PredictionRefType.convert` and `DatasetRefType.convert`, raising `click.BadParameter` (via
+  `self.fail`). This matches `decode_prediction_row`'s existing `IndexError` on negative indices and
+  prevents h5py-style negative indexing from silently selecting the last row. - Replace `with
+  ThreadPoolExecutor() as pool:` with explicit pool management plus an `audio_timed_out` flag. On
+  `TimeoutError`, the outer `finally` calls `pool.shutdown(wait=False, cancel_futures=True)` so a
+  stuck audio future no longer makes shutdown block forever — the previous structure made the
+  timeout handler ornamental because the with-block still waited on the same future during teardown.
+
+Adds CPU-only tests for the new negative-index validation in both ref-type parsers.
+
+* fix(scripts): render session-recording synchronously before opening editor
+
+- Run `play_audio_recorded` synchronously *before* `plugin.show_editor` when
+  `--session-recording-path` is set, so the deterministic clip depends only on the initially-loaded
+  plugin state. Previously the 10s render ran in a background thread alongside the editor, letting
+  the user twist knobs mid-render and break the determinism guarantee the docs and help text both
+  promise. - No live-audio thread is spawned on the session-recording path now; the audio-future
+  drain logic only runs for the live-stream path. - Updated the "Editor closed..." log message to
+  tell the user that a keystroke is needed to proceed (the keyboard-loop blocks in
+  `click.getchar()`; this is the documented known limitation, and a hard timeout would silently drop
+  captured patches). - Tightened doc wording: "useful for headless runs" → "useful when no audio
+  output device is available"; clarified that the editor still needs a display. Adopted Copilot's
+  suggested phrasing for the keyboard-thread sentence ("checks that event only between
+  click.getchar() calls, so it may not exit until another key is pressed").
+
+
 ## v0.6.2 (2026-04-30)
 
 ### Bug Fixes
