@@ -1,8 +1,6 @@
-import _thread
 import sys
 import threading
-import time
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import mido
 import numpy as np
@@ -10,30 +8,8 @@ from loguru import logger
 from pedalboard import VST3Plugin
 from pedalboard.io import AudioFile
 
-
-def _call_with_interrupt(fn: Callable, sleep_time: float = 2.0):
-    """Calls the function fn on the main thread, while another thread sends a KeyboardInterrupt
-    (SIGINT) to the main thread."""
-
-    def send_interrupt():
-        # Brief sleep so that fn starts before we send the interrupt
-        time.sleep(sleep_time)
-        _thread.interrupt_main()
-
-    # Create and start the thread that sends the interrupt
-    t = threading.Thread(target=send_interrupt)
-    t.start()
-
-    try:
-        fn()
-    except KeyboardInterrupt:
-        print("Interrupted main thread.")
-    finally:
-        t.join()
-
-
-def _prepare_plugin(plugin: VST3Plugin) -> None:
-    _call_with_interrupt(plugin.show_editor, sleep_time=2.0)
+# How long the editor stays open before we signal it to close.
+_EDITOR_INIT_DELAY_SECONDS = 0.5
 
 
 def load_plugin(plugin_path: str) -> VST3Plugin:
@@ -49,8 +25,15 @@ def load_plugin(plugin_path: str) -> VST3Plugin:
     # audit on #714 for the empirical justification.
     if sys.platform != "darwin":
         logger.info("Preparing plugin for preset load...")
-        _prepare_plugin(p)
-        logger.info("Plugin ready")
+        close_editor = threading.Event()
+        timer = threading.Timer(_EDITOR_INIT_DELAY_SECONDS, close_editor.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            p.show_editor(close_editor)
+        finally:
+            timer.cancel()
+            close_editor.set()  # defensive: ensure show_editor unblocks even if Timer fails
     return p
 
 
@@ -71,7 +54,7 @@ def write_wav(audio: np.ndarray, path: str, sample_rate: float, channels: int) -
 
 
 def render_params(
-    plugin: VST3Plugin,
+    plugin_path: str,
     params: dict[str, float],
     midi_note: int,
     velocity: int,
@@ -81,6 +64,12 @@ def render_params(
     channels: int,
     preset_path: Optional[str] = None,
 ) -> np.ndarray:
+    """Render a single audio sample by loading the plugin fresh per call.
+
+    Reloads the plugin on every call to work around stale-state bug #489. This incurs an extra
+    plugin-load per render; see #705 for the perf follow-up.
+    """
+    plugin = load_plugin(plugin_path)
     if preset_path is not None:
         load_preset(plugin, preset_path)
 
