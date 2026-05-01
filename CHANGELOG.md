@@ -1,6 +1,102 @@
 # CHANGELOG
 
 
+## v0.7.1 (2026-05-01)
+
+### Bug Fixes
+
+- **scripts**: Drop `exec` from run-linux-vst-headless.sh's dbus-run-session call
+  ([#736](https://github.com/tinaudio/synth-setter/pull/736),
+  [`3af7bca`](https://github.com/tinaudio/synth-setter/commit/3af7bcaaafe9f87aa048969f81d0524015264492))
+
+With `exec dbus-run-session -- "$@"`, the wrapper bash process is replaced by dbus-run-session and
+  the `trap cleanup EXIT` above never fires. Xvfb, xsettingsd, and openbox stay alive after the
+  wrapped command exits, which on RunPod prevents SkyPilot's job-status reporter from seeing the SSH
+  session's process tree go quiet — the worker job stays in RUNNING forever even after it has
+  rendered the shard and uploaded both files to R2.
+
+Drop the `exec` so bash stays in scope; the existing trap fires when dbus-run-session returns and
+  reaps the X-stack daemons before the wrapper itself exits.
+
+Bisected via `.github/workflows/test-skypilot-debug.yml` (run 25225552875). The `no-exec` matrix
+  variant (same wrapper, no `exec`) passes; the production-shape `headless` variant fails.
+
+Fixes #735
+
+Co-authored-by: Your Name <you@example.com>
+
+### Build System
+
+- **deps**: Add skypilot[runpod]==0.12.0 to requirements-app.txt
+  ([#729](https://github.com/tinaudio/synth-setter/pull/729),
+  [`0d673b7`](https://github.com/tinaudio/synth-setter/commit/0d673b7b422c1dea888ea14bfabd740a2671e54b))
+
+Bakes the SkyPilot RunPod backend into images built from requirements-app.txt (notably
+  tinaudio/synth-setter:dev-snapshot) so scripts/skypilot_launch_smoke.py can import `sky` without a
+  runtime pip install.
+
+The Test Dataset Generation workflow currently works around the missing dependency with a `uv pip
+  install` stopgap inside the container; once dev-snapshot is rebuilt and republished from the
+  current Dockerfile after this lands, that stopgap can be removed.
+
+Refs #534
+
+Co-authored-by: Your Name <you@example.com>
+
+- **devcontainer**: Add common-utils feature to CPU + GPU devcontainers
+  ([#738](https://github.com/tinaudio/synth-setter/pull/738),
+  [`751e958`](https://github.com/tinaudio/synth-setter/commit/751e958215b667bb58400cdf68102d89c9e9b6e6))
+
+Adds the ghcr.io/devcontainers/features/common-utils:2 feature to both
+  .devcontainer/cpu/devcontainer.json and .devcontainer/gpu/devcontainer.json.
+
+Refs #737
+
+Co-authored-by: Your Name <you@example.com>
+
+### Refactoring
+
+- **testing**: Scope live-logging detach fixture to the 7 failing tests
+  ([#733](https://github.com/tinaudio/synth-setter/pull/733),
+  [`31b06ab`](https://github.com/tinaudio/synth-setter/commit/31b06ab40d77d1a84a4997108581d5e0d4685ed3))
+
+* fix(testing): detach pytest live-logging handler around CliRunner tests
+
+7 error-path tests in tests/test_docker_entrypoint.py crash inside CliRunner.invoke()'s
+  finally-block with "ValueError: I/O operation on closed file" in environments where the project
+  default log_cli=True triggers _LiveLoggingStreamHandler. The handler's emit() opens
+  global_and_fixture_disabled, which suspends pytest's global capture and closes the captured stream
+  that CliRunner.isolation() wrote into sys.stdout. A logger.error(...) call inside the click
+  callback under test then makes the finally-block .getvalue() raise on a closed buffer.
+
+This reproduces in the Docker build job (click 8.1.8 + pytest 9.0.3) and on local macOS (click 8.3.1
+  + pytest 9.0.2); does not reproduce on GitHub-hosted Ubuntu/macOS runners with the same versions.
+  So the cause is the live-logging handler interaction, not click version.
+
+Fix: small autouse fixture that detaches _LiveLoggingStreamHandler from the root logger for each
+  test in this file and reattaches in teardown. caplog and pytest's per-test "Captured log call"
+  output are unaffected (they use different handlers).
+
+Closes #730
+
+* refactor(testing): scope live-logging detach fixture to the 7 failing tests
+
+Replace the autouse fixture from #732 with an opt-in fixture, applied via pytest.mark.usefixtures
+  only on the 7 error-path tests that drive a click callback whose error path calls
+  logger.error(...). Other tests in the file don't exercise that code path and shouldn't pay the
+  indirection.
+
+The 7 tests opting in: - TestIdle::test_idle_exec_failure_becomes_click_exception -
+  TestPassthrough::test_passthrough_exec_failure_becomes_click_exception -
+  TestGenerateDataset::test_malformed_json_spec_exits_nonzero_without_calling_run -
+  TestGenerateDataset::test_invalid_spec_shape_exits_nonzero_without_calling_run -
+  TestGenerateDataset::test_binary_spec_file_exits_nonzero_without_calling_run -
+  TestRenderEval::test_render_eval_fails_loudly_with_issue_pointer -
+  TestTrain::test_train_fails_loudly_with_issue_pointer
+
+Refs #730
+
+
 ## v0.7.0 (2026-04-30)
 
 ### Features
