@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import plistlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,9 +11,9 @@ from pydantic import ValidationError
 from pipeline.schemas.config import DatasetConfig, SplitsConfig
 from pipeline.schemas.prefix import DatasetConfigId
 from pipeline.schemas.spec import (
+    SURGE_XT_RENDERER_VERSION,
     DatasetPipelineSpec,
     ShardSpec,
-    extract_renderer_version,
     materialize_spec,
 )
 from src.data.vst import param_specs
@@ -280,60 +279,6 @@ class TestDatasetPipelineSpec:
         assert restored == spec
 
 
-class TestExtractRendererVersion:
-    """Platform-specific VST3 plugin version extraction."""
-
-    def test_extracts_version_from_linux_moduleinfo_json(self, tmp_path: Path) -> None:
-        """Linux moduleinfo.json with Version key returns the version string."""
-        plugin = tmp_path / "Plugin.vst3"
-        contents = plugin / "Contents"
-        contents.mkdir(parents=True)
-        (contents / "moduleinfo.json").write_text('{"Version": "1.3.4"}')
-        assert extract_renderer_version(plugin) == "1.3.4"
-
-    def test_extracts_version_from_macos_info_plist(self, tmp_path: Path) -> None:
-        """MacOS Info.plist with CFBundleShortVersionString returns the version."""
-        plugin = tmp_path / "Plugin.vst3"
-        contents = plugin / "Contents"
-        contents.mkdir(parents=True)
-        plist_data = {"CFBundleShortVersionString": "1.3.4"}
-        (contents / "Info.plist").write_bytes(plistlib.dumps(plist_data))
-        assert extract_renderer_version(plugin) == "1.3.4"
-
-    def test_prefers_moduleinfo_json_when_both_exist(self, tmp_path: Path) -> None:
-        """When both version files exist, moduleinfo.json takes precedence."""
-        plugin = tmp_path / "Plugin.vst3"
-        contents = plugin / "Contents"
-        contents.mkdir(parents=True)
-        (contents / "moduleinfo.json").write_text('{"Version": "2.0.0"}')
-        plist_data = {"CFBundleShortVersionString": "1.0.0"}
-        (contents / "Info.plist").write_bytes(plistlib.dumps(plist_data))
-        assert extract_renderer_version(plugin) == "2.0.0"
-
-    def test_raises_when_no_version_file_and_no_loadable_plugin(self, tmp_path: Path) -> None:
-        """Empty Contents directory with no loadable plugin raises an error."""
-        plugin = tmp_path / "Plugin.vst3"
-        contents = plugin / "Contents"
-        contents.mkdir(parents=True)
-        with pytest.raises(Exception):  # noqa: B017
-            extract_renderer_version(plugin)
-
-    def test_raises_file_not_found_when_plugin_path_does_not_exist(self, tmp_path: Path) -> None:
-        """Nonexistent plugin path raises FileNotFoundError with clear message."""
-        plugin = tmp_path / "nonexistent.vst3"
-        with pytest.raises(FileNotFoundError, match="Plugin path does not exist"):
-            extract_renderer_version(plugin)
-
-    def test_raises_key_error_when_version_field_missing(self, tmp_path: Path) -> None:
-        """moduleinfo.json without Version key raises KeyError."""
-        plugin = tmp_path / "Plugin.vst3"
-        contents = plugin / "Contents"
-        contents.mkdir(parents=True)
-        (contents / "moduleinfo.json").write_text('{"Name": "TestPlugin"}')
-        with pytest.raises(KeyError):
-            extract_renderer_version(plugin)
-
-
 class TestMaterializeSpec:
     """Behavioral tests for materialize_spec."""
 
@@ -352,7 +297,7 @@ class TestMaterializeSpec:
         assert spec.created_at == FIXED_NOW
         assert spec.code_version == "abc123def456"
         assert spec.is_repo_dirty is False
-        assert spec.renderer_version == "1.3.4"
+        assert spec.renderer_version == SURGE_XT_RENDERER_VERSION
         assert spec.output_format == "hdf5"
         assert spec.sample_rate == 16000
         assert spec.shard_size == 10000
@@ -467,12 +412,19 @@ class TestMaterializeSpec:
 
         assert spec.is_repo_dirty is dirty_value
 
-    def test_renderer_version_from_plugin(
+    def test_renderer_version_pinned_to_constant(
         self,
         patch_materialize_io: Path,
         valid_config_dict: dict,
     ) -> None:
-        """renderer_version comes from the plugin's moduleinfo.json."""
+        """materialize_spec pins renderer_version to SURGE_XT_RENDERER_VERSION.
+
+        The launcher path is interpreter-only (no pedalboard / X11), so the spec's
+        renderer_version is a constant trusted at materialize time. The matching
+        constraint check happens worker-side: pipeline.entrypoints.generate_dataset.run
+        calls pipeline.schemas.spec.extract_renderer_version against the actual
+        plugin and fails the run on mismatch.
+        """
         valid_config_dict["plugin_path"] = str(patch_materialize_io)
         valid_config_dict["num_shards"] = 1
         valid_config_dict["splits"] = {"train": 1, "val": 0, "test": 0}
@@ -480,7 +432,7 @@ class TestMaterializeSpec:
         config_id = DatasetConfigId("ci-smoke-test")
         spec = materialize_spec(config, config_id)
 
-        assert spec.renderer_version == "1.3.4"
+        assert spec.renderer_version == SURGE_XT_RENDERER_VERSION
 
     def test_unknown_param_spec_raises_key_error(
         self, patch_materialize_io: Path, valid_config_dict: dict
@@ -494,19 +446,6 @@ class TestMaterializeSpec:
         config_id = DatasetConfigId("ci-smoke-test")
 
         with pytest.raises(KeyError):
-            materialize_spec(config, config_id)
-
-    def test_missing_plugin_raises_file_not_found(
-        self, patch_materialize_io: Path, valid_config_dict: dict
-    ) -> None:
-        """Nonexistent plugin_path raises FileNotFoundError."""
-        valid_config_dict["plugin_path"] = "/nonexistent/path"
-        valid_config_dict["num_shards"] = 1
-        valid_config_dict["splits"] = {"train": 1, "val": 0, "test": 0}
-        config = DatasetConfig(**valid_config_dict)
-        config_id = DatasetConfigId("ci-smoke-test")
-
-        with pytest.raises(FileNotFoundError):
             materialize_spec(config, config_id)
 
     def test_wds_output_format_raises_not_implemented(
@@ -580,7 +519,7 @@ class TestMaterializeSpecIntegration:
 
         assert re.fullmatch(r"[0-9a-f]{40}", spec.code_version)
         assert isinstance(spec.is_repo_dirty, bool)
-        assert spec.renderer_version == "1.0.0-test"
+        assert spec.renderer_version == SURGE_XT_RENDERER_VERSION
         assert spec.created_at.tzinfo is not None
         assert spec.run_id.startswith("integration-test-")
         assert spec.num_shards == 1

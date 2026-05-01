@@ -17,8 +17,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from loguru import logger
+
 from pipeline.constants import INPUT_SPEC_FILENAME
 from pipeline.schemas.spec import DatasetPipelineSpec, ShardSpec
+from src.data.vst.core import extract_renderer_version
 
 # Bootstraps Xvfb + xsettingsd + dbus for VST3 plugin init; resolved relative
 # to the container WORKDIR (``/home/build/synth-setter``) baked in the image.
@@ -29,8 +32,34 @@ VST_HEADLESS_WRAPPER = "scripts/run-linux-vst-headless.sh"
 
 
 def _rclone_copy(src: str, dest: str) -> None:
-    """Upload a file to R2 via rclone with checksum verification."""
-    subprocess.check_call(["rclone", "copy", "--checksum", src, dest])  # noqa: S603, S607
+    """Upload a file to R2 via rclone with checksum verification.
+
+    Connection-level timeouts and retries are rclone's job, not ours:
+      --contimeout=30s   bound the TCP connect phase
+      --timeout=300s     bound any single HTTP request (PUT, list, etc.)
+      --retries=3        retry the whole copy on transient failure
+      -vv                emit per-request debug log so a failure leaves
+                         actionable evidence in the worker stdout
+    A non-zero rclone exit raises CalledProcessError and the run fails — we
+    do not silently accept partial uploads behind a Python wall-clock.
+    """
+    args = [  # noqa: S607 — rclone resolved by the image's PATH
+        "rclone",
+        "copy",
+        "-vv",
+        "--checksum",
+        "--contimeout=30s",
+        "--timeout=300s",
+        "--retries=3",
+        src,
+        dest,
+    ]
+    subprocess.check_call(args)  # noqa: S603 — args from validated spec
+    # Distinct sentinel so we can grep CI logs for "rclone returned" and tell
+    # at a glance whether the rclone subprocess actually exited (vs. hanging
+    # post-upload — see #735). If the upload itself failed, check_call already
+    # raised before we got here.
+    logger.info(f"rclone returned cleanly: {src} -> {dest}")
 
 
 def build_generate_args(
@@ -106,6 +135,20 @@ def run(spec: DatasetPipelineSpec) -> None:
             f"generate_vst_dataset.py only supports hdf5 output, got: {spec.output_format}"
         )
 
+    # Constraint check: the plugin actually present on this worker must match the
+    # renderer_version pinned into the spec at materialize time. The launcher trusts
+    # SURGE_XT_RENDERER_VERSION blindly so its code path stays interpreter-only;
+    # the worker is where pedalboard is available, so this is where we verify.
+    actual_renderer_version = extract_renderer_version(Path(spec.plugin_path))
+    if actual_renderer_version != spec.renderer_version:
+        raise RuntimeError(
+            f"Renderer version mismatch: spec pins {spec.renderer_version!r} but "
+            f"plugin at {spec.plugin_path} reports {actual_renderer_version!r}. "
+            "Rebuild the image against the matching SURGE_GIT_REF, or bump "
+            "SURGE_XT_RENDERER_VERSION in pipeline.schemas.spec."
+        )
+    logger.info(f"renderer_version OK: plugin at {spec.plugin_path} == {spec.renderer_version}")
+
     r2_dest_prefix = f"r2:{spec.r2_bucket}/{spec.r2_prefix}"
 
     with tempfile.TemporaryDirectory() as work_dir_str:
@@ -118,15 +161,21 @@ def run(spec: DatasetPipelineSpec) -> None:
         # double-name issue a full object-key destination would cause.
         spec_path = work_dir / INPUT_SPEC_FILENAME
         spec_path.write_text(spec.model_dump_json(indent=2))
+        logger.info(f"spec written: {spec_path}")
         _rclone_copy(str(spec_path), r2_dest_prefix)
+        logger.info(f"spec uploaded -> {r2_dest_prefix}")
 
         # Single-shard only: picks spec.shards[0] unconditionally. Guarded by
         # the fail-fast check above; multi-shard support tracked in #407.
         shard = spec.shards[0]
         args = [VST_HEADLESS_WRAPPER, *build_generate_args(spec, shard, work_dir)]
+        logger.info(f"rendering shard {shard.shard_id} -> {shard.filename}")
         subprocess.check_call(args)  # noqa: S603 — args built from validated spec
         shard_path = work_dir / shard.filename
+        size = shard_path.stat().st_size if shard_path.exists() else 0
+        logger.info(f"shard rendered: {shard_path} ({size} bytes)")
         _rclone_copy(str(shard_path), r2_dest_prefix)
+        logger.info(f"shard uploaded: {shard.filename} -> {r2_dest_prefix}")
 
 
 if __name__ == "__main__":
