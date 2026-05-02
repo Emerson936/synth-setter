@@ -18,7 +18,7 @@ from click.testing import CliRunner
 
 from pipeline.entrypoints.skypilot_launch_smoke import (
     _WORKER_ENV_KEYS,
-    WORKER_SPEC_PATH,
+    _WORKER_SPEC_URI_ENV,
     load_worker_env,
     main,
 )
@@ -79,7 +79,7 @@ def patch_materialize_io(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture()
 def config_yaml(tmp_path: Path, fake_plugin: Path) -> Path:
     """Write a valid DatasetConfig YAML pointed at the fake plugin."""
-    path = tmp_path / "ci-smoke-test.yaml"
+    path = tmp_path / "runpod-smoke-shard.yaml"
     path.write_text(yaml.safe_dump(_make_config(fake_plugin), sort_keys=False))
     return path
 
@@ -128,6 +128,19 @@ def clear_worker_env_from_process(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for key in _WORKER_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def mock_rclone_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Globally no-op the rclone subprocess that `upload_spec_to_r2` would invoke.
+
+    Tests that explicitly want to assert on the rclone command shape override this
+    by setting their own side_effect on `subprocess.check_call`.
+    """
+    monkeypatch.setattr(
+        "pipeline.entrypoints.skypilot_launch_smoke.subprocess.check_call",
+        lambda args: None,
+    )
 
 
 def _succeeded_run(mock_sky: MagicMock) -> None:
@@ -338,7 +351,7 @@ class TestMainCli:
         assert forwarded["RCLONE_CONFIG_R2_ACCESS_KEY_ID"] == "key"
         assert forwarded["RCLONE_CONFIG_R2_ENDPOINT"].startswith("https://")
 
-    def test_spec_is_mounted_via_sibling_copy_with_matching_content(
+    def test_spec_uri_forwarded_to_worker_env_after_r2_upload(
         self,
         config_yaml: Path,
         template_yaml: Path,
@@ -346,54 +359,40 @@ class TestMainCli:
         patch_materialize_io: None,
         local_spec_dir: Path,
         mock_sky: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The mount source is a sibling copy whose content matches the materialized spec."""
-        captured: dict[str, str] = {}
+        """`upload_spec_to_r2` puts the spec at `r2://<bucket>/skypilot-launcher-
+        specs/<cluster>.json` and the launcher injects that URI into the worker's env via
+        WORKER_SPEC_URI.
 
-        def _capture(mounts: dict[str, str]) -> None:
-            for k, v in mounts.items():
-                captured[k] = Path(v).read_text()
-
-        task = mock_sky.Task.from_yaml.return_value
-        task.update_file_mounts.side_effect = _capture
+        The launcher
+        does NOT call `task.update_file_mounts(...)` (#749 workaround).
+        """
+        rclone_invocations: list[list[str]] = []
+        monkeypatch.setattr(
+            "pipeline.entrypoints.skypilot_launch_smoke.subprocess.check_call",
+            lambda args: rclone_invocations.append(args),
+        )
 
         result = _invoke(config_yaml, template_yaml, env_file, "--cluster-name", "smoke-job-1")
         assert result.exit_code == 0, result.output
 
-        task.update_file_mounts.assert_called_once()
-        mounts = task.update_file_mounts.call_args.args[0]
-        assert WORKER_SPEC_PATH in mounts
-
-        spec_files = list(local_spec_dir.glob("*.json"))
-        assert len(spec_files) == 1
-        spec_path = spec_files[0]
-        mount_source = Path(mounts[WORKER_SPEC_PATH])
-        assert mount_source != spec_path
-        assert captured[WORKER_SPEC_PATH] == spec_path.read_text()
-
-    def test_mount_source_sibling_is_cleaned_up_after_run(
-        self,
-        config_yaml: Path,
-        template_yaml: Path,
-        env_file: Path,
-        patch_materialize_io: None,
-        local_spec_dir: Path,
-        mock_sky: MagicMock,
-    ) -> None:
-        """The `.mount.json` sibling is unlinked in finally so it doesn't survive the run."""
-        captured_mount_source: dict[str, Path] = {}
-
-        def _capture(mounts: dict[str, str]) -> None:
-            captured_mount_source["path"] = Path(mounts[WORKER_SPEC_PATH])
-
         task = mock_sky.Task.from_yaml.return_value
-        task.update_file_mounts.side_effect = _capture
+        task.update_envs.assert_called_once()
+        forwarded = task.update_envs.call_args.args[0]
+        assert (
+            forwarded[_WORKER_SPEC_URI_ENV]
+            == "r2://intermediate-data/skypilot-launcher-specs/smoke-job-1.json"
+        )
 
-        result = _invoke(config_yaml, template_yaml, env_file, "--cluster-name", "smoke-job-1")
-        assert result.exit_code == 0, result.output
-        assert not captured_mount_source["path"].exists()
+        assert len(rclone_invocations) == 1
+        cmd = rclone_invocations[0]
+        assert cmd[:2] == ["rclone", "copyto"]
+        assert cmd[-1] == "r2:intermediate-data/skypilot-launcher-specs/smoke-job-1.json"
 
-    def test_launch_uses_autostop_zero_and_down_true(
+        task.update_file_mounts.assert_not_called()
+
+    def test_launch_uses_autostop_window_and_down_true(
         self,
         config_yaml: Path,
         template_yaml: Path,
@@ -402,14 +401,16 @@ class TestMainCli:
         local_spec_dir: Path,
         mock_sky: MagicMock,
     ) -> None:
-        """`sky.launch` is called with the autostop+down combo the launcher relies on."""
+        """`sky.launch` keeps `down=True` for cleanup but uses a multi-minute autostop window — at
+        idle=0 SkyPilot tears down the cluster within ~1 min of the worker exiting, racing the
+        polling cadence and surfacing as ClusterDoesNotExist."""
         result = _invoke(config_yaml, template_yaml, env_file, "--cluster-name", "smoke-job-1")
         assert result.exit_code == 0, result.output
 
         mock_sky.launch.assert_called_once()
         kwargs = mock_sky.launch.call_args.kwargs
         assert kwargs["cluster_name"] == "smoke-job-1"
-        assert kwargs["idle_minutes_to_autostop"] == 0
+        assert kwargs["idle_minutes_to_autostop"] >= 2
         assert kwargs["down"] is True
 
     def test_tail_logs_invoked_with_follow_false(
@@ -461,7 +462,7 @@ class TestMainCli:
         kwargs: dict[str, Any] = mock_sky.launch.call_args.kwargs
         assert kwargs["cluster_name"].startswith("synth-setter-smoke-")
         assert kwargs["cluster_name"].endswith(config_id[:8])
-        assert kwargs["idle_minutes_to_autostop"] == 0
+        assert kwargs["idle_minutes_to_autostop"] >= 2
         assert kwargs["down"] is True
 
     def test_spec_out_overrides_default_path(
@@ -532,6 +533,53 @@ class TestMainCli:
         assert "did not reach a terminal status" in result.output
         mock_sky.down.assert_called_once()
 
+    def test_cluster_not_up_error_is_swallowed_keeps_polling(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`sky.job_status` raises ClusterNotUpError when the cluster is still INIT (provisioning
+        slow).
+
+        The launcher's poll loop must treat that as 'not yet ready, keep polling' instead of
+        crashing — otherwise a slow RunPod provisioning window fails the launcher even though the
+        cluster will reach UP eventually.
+        """
+        import sky  # noqa: PLC0415
+        from sky import ClusterStatus  # noqa: PLC0415
+        from sky.exceptions import ClusterNotUpError  # noqa: PLC0415
+
+        first_call = [True]
+
+        def stream_and_get(req: str) -> object:
+            if req == "launch-req":
+                return (1, MagicMock())
+            if req == "down-req":
+                return None
+            if req == "job-status-req":
+                if first_call[0]:
+                    first_call[0] = False
+                    raise ClusterNotUpError("provisioning", cluster_status=ClusterStatus.INIT)
+                return {1: sky.JobStatus.SUCCEEDED}
+            raise AssertionError(f"unexpected request: {req}")
+
+        mock_sky.stream_and_get.side_effect = stream_and_get
+        monkeypatch.setattr(
+            "pipeline.entrypoints.skypilot_launch_smoke._JOB_POLL_INTERVAL_SECONDS", 0
+        )
+
+        result = _invoke(config_yaml, template_yaml, env_file, "--cluster-name", "smoke-cnu")
+        assert result.exit_code == 0, result.output
+        assert "cluster not yet UP" in result.output
+        assert "retrying" in result.output
+        assert "status=SUCCEEDED" in result.output
+        mock_sky.down.assert_called_once()
+
     def test_launch_returning_none_job_id_aborts(
         self,
         config_yaml: Path,
@@ -572,7 +620,7 @@ class TestMainCli:
         assert "Worker log dump failed: boom" in result.output
         mock_sky.down.assert_called_once()
 
-    def test_mount_source_cleaned_up_on_launch_exception(
+    def test_local_spec_persists_for_artifact_upload_even_on_launch_exception(
         self,
         config_yaml: Path,
         template_yaml: Path,
@@ -580,8 +628,15 @@ class TestMainCli:
         patch_materialize_io: None,
         local_spec_dir: Path,
         mock_sky: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If sky.launch raises, the staged `.mount.json` sibling is still cleaned up."""
+        """If sky.launch raises after the launcher materialized + R2-uploaded the spec, the local
+        spec file under LOCAL_SPEC_DIR is still around for downstream artifact upload."""
+        # Mock the rclone upload subprocess so this test doesn't need a real R2 endpoint.
+        monkeypatch.setattr(
+            "pipeline.entrypoints.skypilot_launch_smoke.subprocess.check_call",
+            lambda args: None,
+        )
         mock_sky.launch.side_effect = RuntimeError("boom")
 
         result = _invoke(config_yaml, template_yaml, env_file)
@@ -589,6 +644,6 @@ class TestMainCli:
 
         spec_files = list(local_spec_dir.glob("*.json"))
         assert len(spec_files) == 1
-        local_spec_path = spec_files[0]
-        mount_sibling = local_spec_path.with_suffix(".mount.json")
-        assert not mount_sibling.exists()
+        assert spec_files[0].read_text(), (
+            "local spec file should still be on disk for artifact upload"
+        )

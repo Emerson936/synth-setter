@@ -1,10 +1,14 @@
 # SkyPilot task template for RunPod.
 #
 # Loaded by pipeline/entrypoints/skypilot_launch_smoke.py via sky.Task.from_yaml(...).
-# The launcher injects R2 credentials (via task.update_envs) and the
-# materialized DatasetPipelineSpec (via task.update_file_mounts) before
+# The launcher uploads the materialized spec to R2 (`r2://<bucket>/skypilot-launcher-specs/<cluster>.json`)
+# and injects credentials + the spec URI via task.update_envs(...) before
 # calling sky.launch(task, cluster_name=..., down=True). Unmanaged launch
 # (not sky.jobs.launch) — RunPod has no managed-jobs controller backend.
+#
+# Spec ships via R2 (not file_mounts) because programmatic `task.update_file_mounts(...)`
+# triggers a SkyPilot RunPod-backend pubkey-overflow rejection at pod-create
+# time (see #749 for evidence + investigation status).
 #
 # Image: tinaudio/synth-setter:dev-snapshot must be pushed to Docker Hub
 # (`make docker-build-dev-snapshot` then `docker push`) before launch.
@@ -31,27 +35,53 @@ resources:
   image_id: docker:tinaudio/synth-setter:dev-snapshot
 
 # Placeholders. Real values are injected by the launcher via update_envs.
+# WORKER_SPEC_URI is set per-cluster by the launcher to the r2:// URI of the
+# uploaded spec; the worker downloads from there via load_spec_from_uri.
 envs:
   RCLONE_CONFIG_R2_TYPE: ""
   RCLONE_CONFIG_R2_PROVIDER: ""
   RCLONE_CONFIG_R2_ACCESS_KEY_ID: ""
   RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ""
   RCLONE_CONFIG_R2_ENDPOINT: ""
+  WORKER_SPEC_URI: ""
 
-# <repo_root>/data/skypilot-launch-smoke-spec.json is mounted by the launcher via
-# update_file_mounts. Keep this path in sync with WORKER_SPEC_PATH in
-# pipeline/entrypoints/skypilot_launch_smoke.py.
 setup: |
   echo "synth-setter worker ready (host: $(hostname))"
 
+# `run:` block notes (kept out of the heredoc — comments inside YAML
+# block-scalars are read by bash and stray quotes / backticks have caused
+# unintended shell expansions in the past):
+#
+# - First echo is a diagnostic: SkyPilot's run block does NOT cd to the
+#   image's WORKDIR (`/home/build/synth-setter`) by default — it lands
+#   in `~/sky_workdir`. The cd that follows is what makes the relative
+#   path to `scripts/run-linux-vst-headless.sh` resolve.
+# - The Python invocation is inlined (instead of calling the docker
+#   entrypoint's click subcommand) so we can `os._exit(0)` immediately
+#   after `run()` returns successfully. Workaround for #735: the SkyPilot
+#   RunPod worker consistently hangs at Python interpreter shutdown —
+#   some library (most likely pedalboard / numba / dask / h5py) leaves
+#   a non-daemon thread alive and the interpreter never exits. SkyPilot's
+#   job-status reporter sees the SSH session's process tree still alive
+#   and the job stays in RUNNING forever even though both rclone uploads
+#   have already landed in R2. `os._exit(0)` bypasses atexit /
+#   non-daemon-thread join and lets SkyPilot register SUCCEEDED.
+# - Scoping the workaround to this template (vs. an env-var gate in
+#   scripts/docker_entrypoint.py) keeps `generate_dataset` clean for
+#   local dev and other CI consumers; only the SkyPilot worker context
+#   force-exits.
+# - Drop this whole inline block (and revert to `python -m
+#   scripts.docker_entrypoint generate_dataset --spec ...`) once #735 is
+#   root-caused at its source. PR-B's `pedalboard-load` matrix variant
+#   is the canary that proves the revert is safe.
 run: |
-  # Diagnostic: which cwd does SkyPilot's run block start in? We expect this
-  # NOT to be /home/build/synth-setter (the image's WORKDIR) — confirming that
-  # is why the cd below is necessary.
   echo "skypilot-run-cwd: $(pwd)"
-  # cd into the repo root before invoking generate_dataset: it shells out to
-  # scripts/run-linux-vst-headless.sh via a relative path, and SkyPilot's run
-  # block does not execute from the image's WORKDIR by default.
   cd /home/build/synth-setter
-  python /usr/local/bin/entrypoint.py generate_dataset \
-    --spec /home/build/synth-setter/data/skypilot-launch-smoke-spec.json
+  python -c '
+  import os
+  from pipeline.entrypoints.generate_dataset import load_spec_from_uri, run
+  spec = load_spec_from_uri(os.environ["WORKER_SPEC_URI"])
+  run(spec)
+  print("forcing interpreter exit (#735 workaround) — bypassing atexit", flush=True)
+  os._exit(0)
+  '
