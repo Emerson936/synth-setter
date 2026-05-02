@@ -309,18 +309,38 @@ If the YAML violates the schema, the workflow fails before any build starts.
 
 ### Tags
 
-| Tag                                              | Mutable? | Purpose                                                     |
-| ------------------------------------------------ | -------- | ----------------------------------------------------------- |
-| `tinaudio/synth-setter:latest`                   | Yes      | Convenience pointer to the most recent default-branch build |
-| `tinaudio/synth-setter:dev-snapshot`             | Yes      | Latest dev-snapshot (convenience)                           |
-| `tinaudio/synth-setter:dev-snapshot-<sha>`       | No       | Immutable, used for smoke tests                             |
-| `tinaudio/synth-setter:devcontainer-tools`       | Yes      | Latest devcontainer-tools (consumed by `.devcontainer/`)    |
-| `tinaudio/synth-setter:devcontainer-tools-<sha>` | No       | Immutable, pinnable from `.devcontainer/Dockerfile`         |
+| Tag                                              | Mutable? | Purpose                                                                          |
+| ------------------------------------------------ | -------- | -------------------------------------------------------------------------------- |
+| `tinaudio/synth-setter:latest`                   | Yes      | Convenience pointer to the most recent default-branch build                      |
+| `tinaudio/synth-setter:dev-snapshot`             | Yes      | Latest dev-snapshot from main (gated like `latest`)                              |
+| `tinaudio/synth-setter:dev-snapshot-<branch>`    | Yes      | Per-branch floating tag for feature-branch dispatches (slug = branch, `/` → `-`) |
+| `tinaudio/synth-setter:dev-snapshot-<sha>`       | No       | Immutable, used for smoke tests                                                  |
+| `tinaudio/synth-setter:devcontainer-tools`       | Yes      | Latest devcontainer-tools (consumed by `.devcontainer/`)                         |
+| `tinaudio/synth-setter:devcontainer-tools-<sha>` | No       | Immutable, pinnable from `.devcontainer/Dockerfile`                              |
 
-Mutable tags (`latest`, `dev-snapshot`) are only published on dispatch/schedule
-runs — not on pull-request build validations. `latest` is additionally gated
-to schedule runs or to `workflow_dispatch` with `git_ref=main`, so dispatching
-from main with a non-main `git_ref` does not overwrite `latest`.
+Both `latest` and `dev-snapshot` are gated to runs that represent the main
+branch — schedule runs, dispatches with `git_ref` in `{main, refs/heads/main, refs/remotes/origin/main}`, and dispatches with a 40-char SHA that resolves
+to the current `origin/main` HEAD (so a deliberate "rebuild main at this
+exact commit" still advances the floating tags). Feature-branch dispatches
+publish to `dev-snapshot-<branch>` instead of overwriting `dev-snapshot`.
+This matters because other workflows (`test-skypilot-debug`,
+`test-dataset-generation`) consume `dev-snapshot` by default — diverting
+feature-branch builds to a per-branch tag prevents in-flight feature work
+from silently changing what those workflows run against.
+
+The branch slug is derived from `git_ref` after stripping well-known ref
+prefixes (`refs/heads/`, `refs/remotes/origin/`), so `feat/foo`,
+`refs/heads/feat/foo`, and `refs/remotes/origin/feat/foo` all publish to
+the same `dev-snapshot-feat-foo` tag. Git tag dispatches (either
+`refs/tags/<tag>` or a bare ref name that exists as a tag on origin) skip
+the per-branch tag entirely — the immutable `dev-snapshot-<sha>` tag is
+the only stable handle for tag builds.
+
+Known limitation: branch names whose slugs collide after normalization
+(e.g., `feat/foo` and `feat-foo`, or two branches sharing their first 100
+chars after slugging) share the same `dev-snapshot-<slug>` tag and can
+overwrite each other. Branches whose names are already Docker-tag-safe and
+≤100 chars are unaffected.
 
 Smoke tests pull the SHA-pinned tag to avoid race conditions with concurrent
 workflow runs.
