@@ -1,20 +1,28 @@
-"""Launch the smoke `generate_dataset` run on RunPod via SkyPilot.
+"""Launch the smoke `generate_dataset` run on RunPod or OCI via SkyPilot.
 
+Provider-neutral entrypoint: the same binary launches against either
+`configs/compute/runpod-template.yaml` or `configs/compute/oci-cpu-template.yaml`.
 Materializes a spec, ships it via R2 (file_mounts blocked by #749), forwards
 worker env via `task.update_envs`, and `sky.launch`-es an unmanaged task with
 live `sky.tail_logs(follow=True)`. Cluster-level launch (not jobs.launch) —
-RunPod has no managed-jobs controller backend.
+neither RunPod nor OCI has a managed-jobs controller backend wired up here.
 
-`--num-workers N>1` fans out N single-node clusters in parallel (RunPod doesn't
-support num_nodes>1). Each rank gets SYNTH_SETTER_WORKER_RANK /
+Per-backend image handling (driven by `--worker-image-tag`):
+- RunPod: `docker:<image>` is set on each Resources entry's `image_id`, so SkyPilot
+  pulls the image at provision time.
+- OCI: SkyPilot's OCI backend rejects `docker:<image>` for `image_id`, so the
+  YAML's `run:` block performs a sub-docker invocation that consumes
+  `WORKER_IMAGE` from env. The launcher always injects `WORKER_IMAGE`.
+
+`--num-workers N>1` fans out N single-node clusters in parallel (neither backend
+supports num_nodes>1 for this workload). Each rank gets SYNTH_SETTER_WORKER_RANK /
 SYNTH_SETTER_NUM_WORKERS injected; one shared spec → one r2_prefix.
-
-First scaffolding under #534. No `compute_config` schema yet — Phase A–C PRs.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,6 +39,11 @@ from pipeline.schemas.spec import DatasetPipelineSpec, materialize_spec
 # Per-cluster R2 key for the materialized spec (file_mounts blocked by #749).
 _LAUNCHER_SPEC_R2_PREFIX = "skypilot-launcher-specs"
 _WORKER_SPEC_URI_ENV = "WORKER_SPEC_URI"
+_WORKER_IMAGE_ENV = "WORKER_IMAGE"
+_WORKER_IMAGE_REPO = "tinaudio/synth-setter"
+
+# OCI distribution tag grammar: leading alnum/_, then up to 127 of [A-Za-z0-9_.-].
+_DOCKER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 # Forwarded via task.update_envs; each resolved from .env then process env.
 # Keep in sync with the envs: block in configs/compute/runpod-template.yaml.
@@ -189,6 +202,18 @@ def upload_spec_to_r2(spec: DatasetPipelineSpec, cluster_name: str) -> str:
         "slice its share."
     ),
 )
+@click.option(
+    "--worker-image-tag",
+    type=str,
+    default="dev-snapshot",
+    show_default=True,
+    help=(
+        "Worker Docker image tag (under tinaudio/synth-setter). Injected as WORKER_IMAGE env "
+        "for the OCI sub-docker invocation, and as Resources.image_id for backends that accept "
+        "`docker:<image>` (e.g. RunPod). OCI's backend rejects `docker:<image>` so its "
+        "image_id is left untouched."
+    ),
+)
 def main(
     config_path: Path,
     template_path: Path,
@@ -196,10 +221,17 @@ def main(
     cluster_name: str | None,
     spec_out: Path | None,
     num_workers: int,
+    worker_image_tag: str,
 ) -> None:
-    """Launch the smoke `generate_dataset` run on RunPod via SkyPilot."""
+    """Launch the smoke `generate_dataset` run via SkyPilot (RunPod or OCI per `--template`)."""
     if num_workers < 1:
         raise click.ClickException(f"--num-workers must be >= 1, got {num_workers}")
+
+    if not _DOCKER_TAG_RE.fullmatch(worker_image_tag):
+        raise click.ClickException(
+            f"--worker-image-tag must match OCI tag grammar [A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}; "
+            f"got {worker_image_tag!r}"
+        )
 
     worker_env = resolve_worker_env(env_file_path)
     if not worker_env:
@@ -244,6 +276,7 @@ def main(
         worker_env_base=worker_env,
         template_path=template_path,
         cluster_names=cluster_names,
+        worker_image_tag=worker_image_tag,
     )
 
     failed = [
@@ -256,10 +289,42 @@ def main(
         )
 
 
+def _override_image_id(task: sky.Task, worker_image: str) -> None:
+    """Pin every Resources entry's image_id to ``docker:<worker_image>`` for backends that take it.
+
+    SkyPilot's OCI backend rejects ``image_id: docker:<image>`` — that path runs the worker via
+    a sub-docker invocation inside the YAML's run: block and consumes WORKER_IMAGE from env, so
+    OCI Resources are left untouched here.
+    """
+    # Lazy-import: the RunPod CI cell runs this launcher inside a dev-snapshot
+    # image that doesn't always carry `skypilot[oci]` extras (the OCI matrix
+    # cell pip-installs the bridge at runtime, RunPod doesn't). Importing at
+    # module level would break the RunPod cell on those images.
+    try:
+        from sky.clouds import OCI as SkyOCI
+
+        oci_cls: type | None = SkyOCI
+    except ImportError:
+        oci_cls = None
+
+    docker_ref = f"docker:{worker_image}"
+    new_resources: list[sky.Resources] = []
+    mutated = False
+    for res in task.resources:
+        if oci_cls is not None and isinstance(res.cloud, oci_cls):
+            new_resources.append(res)
+            continue
+        new_resources.append(res.copy(image_id=docker_ref))
+        mutated = True
+    if mutated:
+        task.set_resources(type(task.resources)(new_resources))
+
+
 def _run_workers(
     worker_env_base: dict[str, str],
     template_path: Path,
     cluster_names: list[str],
+    worker_image_tag: str,
 ) -> list[int]:
     """Launch len(cluster_names) single-node clusters in parallel; return tail_logs rc per rank.
 
@@ -271,12 +336,14 @@ def _run_workers(
         worker_env_base: Env dict forwarded to every rank (rank/world keys are added per call).
         template_path: SkyPilot Task YAML to instantiate per rank.
         cluster_names: One name per rank; ``len()`` defines the world size.
+        worker_image_tag: Docker image tag under tinaudio/synth-setter to inject.
 
     Returns:
         Per-rank tail_logs return code (``0`` = SUCCEEDED, anything else = failed).
     """
     num_workers = len(cluster_names)
     rcs: list[int] = [-1] * num_workers
+    worker_image = f"{_WORKER_IMAGE_REPO}:{worker_image_tag}"
 
     def _launch_and_tail(rank: int) -> int:
         cluster = cluster_names[rank]
@@ -284,8 +351,15 @@ def _run_workers(
             **worker_env_base,
             WORKER_RANK_ENV_VAR: str(rank),
             NUM_WORKERS_ENV_VAR: str(num_workers),
+            _WORKER_IMAGE_ENV: worker_image,
         }
         task = sky.Task.from_yaml(str(template_path))
+        # Sync the launcher's checkout to the cluster so the synced sky_workdir
+        # contains scripts/skypilot_worker_bootstrap.sh — needed while
+        # dev-snapshot lags behind #783 and the OCI template's run: bind-mounts
+        # the workdir into the worker container.
+        task.workdir = str(REPO_ROOT)
+        _override_image_id(task, worker_image)
         task.update_envs(env_for_rank)
         click.echo(f"[{cluster}] provisioning rank={rank}/{num_workers}")
         launch_request_id = sky.launch(
