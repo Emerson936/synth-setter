@@ -704,26 +704,19 @@ def _validate_predictions(predictions_output_dir: Path, num_samples: int) -> Non
             raise ValueError(f"{pred_path} contains NaN/Inf")
 
 
-def _render_predicted_audio(
+def _build_predict_vst_audio_argv(
     predictions_output_dir: Path,
     audio_dir: Path,
-    num_samples: int,
     param_spec_name: str,
     preset_path: str,
-    *,
-    subprocess_runner: SubprocessRunner | None = None,
-) -> None:
-    """Render audio for the predicted patches and validate per-sample outputs (file presence and
-    non-silent WAVs).
+) -> list[str]:
+    """Build the argv list for ``scripts/predict_vst_audio.py`` rendering.
 
-    ``param_spec_name`` and ``preset_path`` must match the values used to capture the patches —
-    otherwise ``predict_vst_audio.py`` would fall back to its own defaults (``surge_xt`` /
-    ``presets/surge-base.vstpreset``) and decode/render against a mismatched spec.
+    On Linux the VST headless wrapper is prepended so the subprocess inherits a Xvfb display.
+    No subprocess execution and no writes; the only side effects are reading ``sys.platform``
+    and an existence check on ``_VST_HEADLESS_WRAPPER`` when running on Linux.
 
-    :raises FileNotFoundError: if the headless wrapper is missing on Linux, if any sample directory
-        is missing, or if a per-sample artifact (target.wav, pred.wav, spec.png, params.csv) is
-        absent.
-    :raises ValueError: if a rendered WAV's peak amplitude is below ``SILENCE_PEAK_THRESHOLD``.
+    :raises FileNotFoundError: on Linux when ``_VST_HEADLESS_WRAPPER`` is absent.
     """
     args: list[str] = []
     if sys.platform == "linux":
@@ -744,6 +737,70 @@ def _render_predicted_audio(
         preset_path,
         "-t",
     ]
+    return args
+
+
+def _validate_rendered_audio_dir(audio_dir: Path, num_samples: int) -> None:
+    """Verify ``predict_vst_audio.py`` wrote ``num_samples`` complete sample directories.
+
+    Each ``sample_{i}`` directory must contain the four expected artifacts (``target.wav``,
+    ``pred.wav``, ``spec.png``, ``params.csv``) and the rendered WAVs must not be silent.
+    Read-only with respect to ``audio_dir`` — no writes and no subprocess execution.
+
+    :raises FileNotFoundError: if a sample directory is missing or any artifact is absent.
+    :raises ValueError: if a rendered WAV's peak amplitude is below ``SILENCE_PEAK_THRESHOLD``.
+    """
+    # Compare as sets so num_samples >= 10 doesn't trip on lexical ordering
+    # (``sample_10`` sorts before ``sample_2`` in a plain ``sorted()``).
+    expected_sample_names = {f"sample_{i}" for i in range(num_samples)}
+    actual_sample_names = {d.name for d in audio_dir.iterdir() if d.is_dir()}
+    if actual_sample_names != expected_sample_names:
+        missing = sorted(expected_sample_names - actual_sample_names)
+        extra = sorted(actual_sample_names - expected_sample_names)
+        raise FileNotFoundError(
+            f"unexpected sample directories in {audio_dir}: missing={missing}, extra={extra}"
+        )
+    for i in range(num_samples):
+        sample_dir = audio_dir / f"sample_{i}"
+        for fname in ("target.wav", "pred.wav", "spec.png", "params.csv"):
+            artifact_path = sample_dir / fname
+            if not artifact_path.is_file():
+                raise FileNotFoundError(f"{artifact_path} not found")
+        for wav_name in ("target.wav", "pred.wav"):
+            with AudioFile(str(sample_dir / wav_name)) as f:
+                audio = f.read(f.frames)
+            peak = float(np.abs(audio).max())
+            if peak <= SILENCE_PEAK_THRESHOLD:
+                raise ValueError(f"{sample_dir.name}/{wav_name} is silent (peak={peak:.2e})")
+
+
+def _render_predicted_audio(
+    predictions_output_dir: Path,
+    audio_dir: Path,
+    num_samples: int,
+    param_spec_name: str,
+    preset_path: str,
+    *,
+    subprocess_runner: SubprocessRunner | None = None,
+) -> None:
+    """Render audio for the predicted patches and validate per-sample outputs.
+
+    Thin orchestrator over :func:`_build_predict_vst_audio_argv` (argv construction) and
+    :func:`_validate_rendered_audio_dir` (post-render checks); neither helper invokes a
+    subprocess, so both are independently testable without a ``subprocess_runner``.
+
+    ``param_spec_name`` and ``preset_path`` must match the values used to capture the patches —
+    otherwise ``predict_vst_audio.py`` would fall back to its own defaults (``surge_xt`` /
+    ``presets/surge-base.vstpreset``) and decode/render against a mismatched spec.
+
+    :raises FileNotFoundError: if the headless wrapper is missing on Linux, if any sample directory
+        is missing, or if a per-sample artifact (target.wav, pred.wav, spec.png, params.csv) is
+        absent.
+    :raises ValueError: if a rendered WAV's peak amplitude is below ``SILENCE_PEAK_THRESHOLD``.
+    """
+    args = _build_predict_vst_audio_argv(
+        predictions_output_dir, audio_dir, param_spec_name, preset_path
+    )
     runner = subprocess_runner if subprocess_runner is not None else subprocess.run
     try:
         runner(  # noqa: S603
@@ -758,26 +815,7 @@ def _render_predicted_audio(
             args,
         )
         raise
-
-    sample_dirs = sorted(d for d in audio_dir.iterdir() if d.is_dir())
-    actual_sample_names = [d.name for d in sample_dirs]
-    expected_sample_names = [f"sample_{i}" for i in range(num_samples)]
-    if actual_sample_names != expected_sample_names:
-        raise FileNotFoundError(
-            f"unexpected sample directories in {audio_dir}: "
-            f"got {actual_sample_names}, expected {expected_sample_names}"
-        )
-    for sample_dir in sample_dirs:
-        for fname in ("target.wav", "pred.wav", "spec.png", "params.csv"):
-            artifact_path = sample_dir / fname
-            if not artifact_path.is_file():
-                raise FileNotFoundError(f"{artifact_path} not found")
-        for wav_name in ("target.wav", "pred.wav"):
-            with AudioFile(str(sample_dir / wav_name)) as f:
-                audio = f.read(f.frames)
-            peak = float(np.abs(audio).max())
-            if peak <= SILENCE_PEAK_THRESHOLD:
-                raise ValueError(f"{sample_dir.name}/{wav_name} is silent (peak={peak:.2e})")
+    _validate_rendered_audio_dir(audio_dir, num_samples)
 
 
 def _compute_and_validate_metrics(
