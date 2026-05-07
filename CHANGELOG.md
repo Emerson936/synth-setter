@@ -1,6 +1,53 @@
 # CHANGELOG
 
 
+## v0.12.0 (2026-05-07)
+
+### Features
+
+- **skypilot**: Add explicit dispatch flags + num_workers config option to launcher
+  ([#842](https://github.com/tinaudio/synth-setter/pull/842),
+  [`044f8b1`](https://github.com/tinaudio/synth-setter/commit/044f8b1a3a5ff75664bdf9956c9a2ad79c597d50))
+
+* feat(skypilot): explicit --api-server / --local dispatch flags
+
+Adds two mutually-exclusive launcher flags so each call site can declare its remote-vs-local intent
+  rather than relying on `SKYPILOT_API_SERVER_ENDPOINT` env-var presence. `--api-server <url>`
+  exports the endpoint and skips the local cred bootstrap; `--local` clears the endpoint so an
+  inherited value can't accidentally route remote and runs the cred bootstrap. Default behavior
+  (neither flag) preserves today's env-var-driven contract.
+
+Wires the skypilot-local matrix row in test-dataset-generation.yml over to `--local` so the env-var
+  dropping workaround from #840's 8eadbf8 is replaced by an explicit positive signal.
+
+Closes #841
+
+* feat(skypilot): read num_workers from dataset config; CLI overrides
+
+Adds `num_workers` to DatasetConfig (default 1, matches the launcher's pre-config CLI default). The
+  launcher resolves fan-out as: `--num-workers` CLI flag wins, else `config.num_workers`, else
+  schema default. Workflows no longer hardcode `--num-workers 3` across multiple call sites — the
+  runpod-smoke-shard.yaml dataset config now declares `num_workers: 3` once so every call site
+  reading that config gets the same fan-out.
+
+* internal-fix(skypilot): address Copilot review on 0363f13
+
+Round-1 review on PR #842 (post-rebase HEAD 0363f13) surfaced 4 issues; this commit addresses each.
+
+Launcher: - _apply_dispatch_mode: rewrite the docstring — Click does NOT natively gate
+  mutually-exclusive options, so the previous "Click validates that" language was misleading. The
+  function is the sole enforcer (#3204315171). - _apply_dispatch_mode: reject blank/whitespace-only
+  --api-server values with a clear ClickException, and strip surrounding whitespace from non-blank
+  values before exporting. Avoids the silent "SKYPILOT_API_SERVER_ENDPOINT=' '" failure mode where
+  downstream cred-bootstrap behavior gets confusing. Pinned by two new tests
+  (test_api_server_flag_strips_surrounding_whitespace, test_api_server_flag_rejects_blank_value)
+  (#3204315273).
+
+Comment hygiene: - pipeline/schemas/config.py: drop misleading "(#841)" reference next to
+  num_workers — #841 tracks dispatch-mode explicitness, not worker fan-out (#3204315215). -
+  TestNumWorkersConfigPrecedence docstring: same drop, same reason (#3204315241).
+
+
 ## v0.11.0 (2026-05-07)
 
 ### Build System
