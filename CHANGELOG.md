@@ -1,6 +1,168 @@
 # CHANGELOG
 
 
+## v0.13.0 (2026-05-07)
+
+### Features
+
+- **param-spec**: Surge_4 mini-example param spec and preset registry
+  ([#820](https://github.com/tinaudio/synth-setter/pull/820),
+  [`f32d49d`](https://github.com/tinaudio/synth-setter/commit/f32d49d889d4a80a63521c486272667a630d9a1f))
+
+* internal-feat(vst): add SURGE_4_PARAM_SPEC mini-example and preset registry
+
+Adds a 4-parameter Surge XT spec (SURGE_4_PARAM_SPEC: amp envelope attack, filter cutoff, LFO
+  amplitude/rate) and a preset_paths registry mapping param_spec names to their base preset files.
+  The spec underlies the smoke-test fixture and the predict_vst_audio end-to-end test.
+
+- param_specs["surge_4"] registered alongside surge_xt/surge_simple. - preset_paths dict added so
+  future code paths can look up the matching preset by spec name (script wiring lands separately). -
+  tests/conftest.py uses surge_4 + presets/surge-mini.vstpreset for the surge fixture;
+  cfg.model.net.d_out now derives from len(param_specs["surge_4"]) instead of being a literal 7 with
+  a comment that would drift when the spec changes. - presets/*.fxp gitignored — local-dev
+  learned-model artifacts excluded from version control by default; commit explicitly with git add
+  -f when one becomes a versioned base preset. - Docs cross-reference preset_paths from
+  --param-spec-name and --preset-path so users know the two flags should agree.
+
+Refs #811
+
+* test(surge): templatize cfg_surge_xt_global() over param_spec_name
+
+Adds a `param_spec_name` fixture (default "surge_4") that drives the surge fixtures:
+  `cfg_surge_xt_global` propagates it to `model.net.d_out` and the `log_per_param_mse` callback;
+  `surge_xt_smoke_datasets` derives the matching `--param_spec` and `--preset_path` from
+  `preset_paths`. Tests can override via indirect parametrization.
+
+Also plumbs the spec through `predict_vst_audio.py` in the surge train+eval e2e test — the script
+  previously defaulted to `--param_spec=surge_xt` while the fixture trained on surge_4, so decode
+  sliced past the end of the predicted tensor and crashed MPS CI with "can only convert an array of
+  size 1 to a Python scalar".
+
+Adds a fast cfg-composition test parametrized over surge_4, surge_simple, surge_xt to lock the
+  templating contract for every supported spec.
+
+* test(configs): add surge/test-mps experiment + cfg-equality guard
+
+Adds `configs/experiment/surge/test-mps.yaml`, a Hydra experiment that resolves to the same cfg
+  `cfg_surge_xt_global(accelerator="mps", param_spec_name="surge_4")` builds in `tests/conftest.py`.
+  Inherits from `surge/base` and overrides `/trainer: mps`, `/callbacks: [default_surge,
+  eval_surge]` so the fixture's open_dict bake-ins (precision=32-true, deterministic, max_steps=1,
+  batch_size=1, lr_monitor null, etc.) are expressed declaratively.
+
+To pin the equality contract:
+
+- Extracts `_build_surge_xt_smoke_cfg(accelerator, param_spec_name)` from the existing
+  `cfg_surge_xt_global` fixture so the cfg can be built on any host (the fixture's accelerator gate
+  hardfails non-MPS runners before composing). The fixture is now a thin wrapper. - Switches the
+  lr_monitor cleanup from `del` to `= None`. `instantiate_callbacks` skips entries without
+  `_target_`, so runtime behavior is unchanged, and the cfg now matches what `lr_monitor: null`
+  produces on the YAML side. - Adds `test_test_mps_yaml_matches_cfg_surge_xt_global` in
+  `tests/test_configs.py`: composes both sides with `resolve=False`, strips volatile top-level keys
+  (`paths`, `hydra`, `task_name`), and asserts deep equality with a human-readable diff on failure.
+
+Future drift in either the fixture or test-mps.yaml fails fast.
+
+* internal-fix(vst): reformat param_specs/preset_paths dicts and annotate
+
+Addresses Copilot review comments #3192020841 and #3202813835 on PR #820: - Multi-line
+  ``param_specs`` dict so ``ruff format`` (line-length 99) stops complaining about the 119-char
+  single-line literal. - Type-annotates both registries (``dict[str, ParamSpec]`` and ``dict[str,
+  str]``) so attribute access is type-checked at the call sites and the ``preset_paths`` keys can't
+  drift out of sync with ``param_specs`` without lint surfacing it.
+
+The third inline comment (#3192020859 — "comment claims SURGE_4 is used by predict_vst_audio test,
+  but the test uses defaults") was already resolved by 2331be5, which plumbs ``--param_spec=surge_4
+  --preset_path=presets/surge-mini.vstpreset`` through to the test's ``predict_vst_audio.py``
+  invocation. No code change needed there.
+
+* test(surge): pin test_cfg_surge_xt_global_wires_param_spec to cpu
+
+Conda CI runs ``pytest -m "not slow"`` which includes the (un-slow)
+  ``test_cfg_surge_xt_global_wires_param_spec`` test. The previous version went through the
+  ``cfg_surge_xt_global`` fixture, which depends on the parametrized ``accelerator`` fixture — and
+  that fixture hardfails the ``[mps-*]`` and ``[gpu-*]`` parametrizations on Linux runners with "MPS
+  not available" / "CUDA not available", failing the conda job.
+
+The cfg-shape contract this test asserts is accelerator-independent (``model.net.d_out`` and
+  ``callbacks.log_per_param_mse.param_spec`` are set by ``_build_surge_xt_smoke_cfg`` regardless of
+  the ``accelerator`` argument). Call the builder directly with ``accelerator="cpu"`` and drop the
+  indirect parametrization so only the three param_spec cases run on every CI runner.
+
+* fix(test): loosen SILENCE_PEAK_THRESHOLD in surge train+eval e2e
+
+Lowers the ``SILENCE_PEAK_THRESHOLD`` from 1e-4 (~-80 dBFS) to 1e-6 (~-120 dBFS) in
+  ``test_train_eval_surge_xt``. The previous threshold was chosen with the rationale that
+  ``compute_rms`` underflows below 1e-4, but that's not actually true: ``compute_rms``'s NaN risk is
+  the cosine-similarity denominator collapsing to 0, which only happens on bit-zero audio.
+
+Symptom: MPS CI on ``faf2be1`` (and ``5b168b8``) failed with ``sample_0/pred.wav is silent
+  (peak=3.05e-05)`` even though peak 3.05e-5 → ~-90 dBFS would not actually underflow downstream
+  metric math. The 1-step-trained smoke model's predicted params, rendered through Surge XT, can
+  land in a quiet (but non-silent) region of param space — and the dataset generator runs without a
+  fixed seed, so the trained model and its predictions vary run-to-run.
+
+Loosening to 1e-6 keeps the original guard against truly silent (bit-zero) audio while letting the
+  legitimate "trained for one step on a randomly-sampled 5-clip fixture" prediction through. The
+  downstream ``np.isfinite(numeric).all()`` assertion on the metrics CSV remains the real
+  correctness check; the silence threshold is just an early-warning fast-fail.
+
+### Monitoring
+
+- **surge-interactive**: Step 1 — DI seams for surge_xt_interactive (de-mock #844)
+  ([#847](https://github.com/tinaudio/synth-setter/pull/847),
+  [`9fb01c2`](https://github.com/tinaudio/synth-setter/commit/9fb01c207ecb5f1a13c47f05a613c9ea9b8f3ded))
+
+* internal-feat(scripts): add four DI seams to surge_xt_interactive
+
+Step 1 of the de-mock test refactor (#844). Production behavior is unchanged: every seam defaults to
+  ``None`` and resolves to the original module-level dependency at call time, so existing
+  ``monkeypatch.setattr(surge_xt_interactive.<dep>, ...)`` tests keep passing while subsequent steps
+  migrate them to direct fake injection.
+
+Seams added:
+
+- ``play_audio(..., audio_stream_factory=None)`` — defaults to a closure that builds the real
+  ``AudioStream`` (lazy ``default_output_device_name`` lookup so test factories never trigger
+  PortAudio device probing). - ``midi_listener(..., port_opener=None)`` — defaults to
+  ``mido.open_input``. - ``_run_predict``, ``_render_predicted_audio``,
+  ``_compute_and_validate_metrics``, all forwarded through ``eval_patches(...,
+  subprocess_runner=None)`` — defaults to ``subprocess.check_call`` / ``subprocess.run`` per call
+  site. ``eval_patches`` forwards a single seam to all three helpers so a recording fake captures
+  every external invocation in one place. - ``_maybe_eval_captured_patches(..., eval_runner=None)``
+  — defaults to ``eval_patches``.
+
+Type aliases ``SubprocessRunner``, ``PortOpener``, ``AudioStreamFactory``, ``EvalRunner`` live near
+  the top of the module, grouped under a ``# ----- Test seams -----`` banner with a comment pointing
+  at #844.
+
+All 407 quick-suite tests pass; pyright clean.
+
+Refs #844
+
+* internal-fix(scripts): type DI seams with Protocols on surge_xt_interactive
+
+Address Copilot review on PR #847: - Add AudioStreamProtocol, MidiPortProtocol, MidiMessageProtocol
+  so the AudioStreamFactory and PortOpener seams expose the structural surface play_audio /
+  midi_listener actually use, instead of widening to ``object``. - Drops pyright ignores at the
+  hot-path call sites (``stream.write(...)`` and ``port_handle.poll()``); leaves a single narrow
+  ignore at the production AudioStream factory boundary. - Reword ``_default_audio_stream_factory``
+  docstring -- it's a plain helper, not a closure. The lazy-default-device-lookup point still
+  stands.
+
+Refs #844.
+
+* docs(scripts): clarify AudioStreamFactory comment — returns context manager
+
+The previous wording said the factory "returns an entered audio-output stream", but the factory
+  actually returns a context manager that ``play_audio`` enters via ``with factory() as stream``.
+  Reword to make that clear and reference the entry site.
+
+The two AudioStreamProtocol/MidiPortProtocol docstrings (which describe the surface of the *entered*
+  object) are unchanged — that wording is accurate for the Protocol shapes themselves.
+
+Refs #844 (Copilot #3204605632)
+
+
 ## v0.12.0 (2026-05-07)
 
 ### Features
