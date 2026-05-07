@@ -203,6 +203,32 @@ def _detect_provider(template_path: Path) -> str:
     return provider
 
 
+_SKYPILOT_API_SERVER_ENV = "SKYPILOT_API_SERVER_ENDPOINT"
+
+
+def _apply_dispatch_mode(api_server: str | None, local: bool) -> None:
+    """Apply the launcher's explicit dispatch-mode selection to ``os.environ``.
+
+    This function is the sole enforcer of the ``--api-server`` / ``--local`` contract —
+    Click does not natively gate mutually-exclusive options, so the runtime check below
+    is what catches both CLI users and programmatic callers. ``--api-server`` exports
+    ``SKYPILOT_API_SERVER_ENDPOINT`` (after stripping surrounding whitespace; blank values
+    rejected) so all subsequent ``sky.*`` calls dispatch to the remote server.
+    ``--local`` clears that env var so an inherited value can't accidentally route
+    remote (the failure mode #841 captures). Neither flag passed → leave the env
+    untouched (backward-compat).
+    """
+    if api_server is not None and local:
+        raise click.ClickException("--api-server and --local are mutually exclusive")
+    if api_server is not None:
+        stripped = api_server.strip()
+        if not stripped:
+            raise click.ClickException("--api-server must be a non-empty URL")
+        os.environ[_SKYPILOT_API_SERVER_ENV] = stripped
+    elif local:
+        os.environ.pop(_SKYPILOT_API_SERVER_ENV, None)
+
+
 def _run_cred_bootstrap(*, provider: str, env_file_path: Path | None = None) -> None:
     """Invoke `scripts/skypilot_write_provider_creds.sh` for `provider`.
 
@@ -217,9 +243,9 @@ def _run_cred_bootstrap(*, provider: str, env_file_path: Path | None = None) -> 
     (when provided) so a local-dev `.env` carrying provider creds bootstraps
     cleanly without manual `export`.
     """
-    if os.environ.get("SKYPILOT_API_SERVER_ENDPOINT"):
+    if os.environ.get(_SKYPILOT_API_SERVER_ENV):
         click.echo(
-            "SKYPILOT_API_SERVER_ENDPOINT is set; remote API server holds provider "
+            f"{_SKYPILOT_API_SERVER_ENV} is set; remote API server holds provider "
             "creds, skipping local cred bootstrap",
             err=True,
         )
@@ -331,14 +357,14 @@ def upload_spec_to_r2(spec: DatasetPipelineSpec, cluster_name: str) -> str:
 @click.option(
     "--num-workers",
     type=int,
-    default=1,
-    show_default=True,
+    default=None,
     help=(
-        "Number of single-node SkyPilot clusters to fan out in parallel. RunPod's backend "
-        "does not support num_nodes>1, so we synthesize multi-worker partitioning by launching "
-        "N independent clusters and injecting SYNTH_SETTER_WORKER_RANK / SYNTH_SETTER_NUM_WORKERS per rank. Each cluster "
-        "downloads the same materialized spec and uses pipeline.partitioning.get_my_shards to "
-        "slice its share."
+        "Number of single-node SkyPilot clusters to fan out in parallel. Overrides the dataset "
+        "config's `num_workers` field; if neither is set, the schema default applies. RunPod's "
+        "backend does not support num_nodes>1, so we synthesize multi-worker partitioning by "
+        "launching N independent clusters and injecting SYNTH_SETTER_WORKER_RANK / "
+        "SYNTH_SETTER_NUM_WORKERS per rank. Each cluster downloads the same materialized spec "
+        "and uses pipeline.partitioning.get_my_shards to slice its share."
     ),
 )
 @click.option(
@@ -369,18 +395,45 @@ def upload_spec_to_r2(spec: DatasetPipelineSpec, cluster_name: str) -> str:
         "are still torn down in `--no-tail` so SkyPilot state doesn't accumulate orphans."
     ),
 )
+@click.option(
+    "--api-server",
+    "api_server",
+    type=str,
+    default=None,
+    help=(
+        "Dispatch to this remote SkyPilot API server URL. Sets SKYPILOT_API_SERVER_ENDPOINT in "
+        "the launcher's process env so all sky.* calls go to the remote server, and skips the "
+        "local cred bootstrap (the remote server holds provider creds). Mutually exclusive with "
+        "--local. When neither is passed the existing env var (if any) is honored."
+    ),
+)
+@click.option(
+    "--local",
+    "local",
+    is_flag=True,
+    default=False,
+    help=(
+        "Force local SDK dispatch. Clears SKYPILOT_API_SERVER_ENDPOINT from the launcher's "
+        "process env so an inherited value can't accidentally route remote (#841), and runs "
+        "the local cred bootstrap. Mutually exclusive with --api-server."
+    ),
+)
 def main(
     config_path: Path,
     template_path: Path,
     env_file_path: Path,
     cluster_name: str | None,
     spec_out: Path | None,
-    num_workers: int,
+    num_workers: int | None,
     worker_image_tag: str,
     tail: bool,
+    api_server: str | None,
+    local: bool,
 ) -> None:
     """Launch the smoke `generate_dataset` run via SkyPilot (RunPod or OCI per `--template`)."""
-    if num_workers < 1:
+    _apply_dispatch_mode(api_server=api_server, local=local)
+
+    if num_workers is not None and num_workers < 1:
         raise click.ClickException(f"--num-workers must be >= 1, got {num_workers}")
 
     if not _DOCKER_TAG_RE.fullmatch(worker_image_tag):
@@ -414,6 +467,11 @@ def main(
     config = load_dataset_config(config_path)
     config_id = dataset_config_id_from_path(config_path)
     spec = materialize_spec(config, config_id)
+
+    # `--num-workers` (if passed) wins over the dataset config's `num_workers`. Schema
+    # default applies when neither is set. The launcher's run-time fan-out is the single
+    # source of truth for worker count from here on.
+    resolved_num_workers = num_workers if num_workers is not None else config.num_workers
 
     base_cluster_name = cluster_name or f"synth-setter-smoke-{config_id[:8]}"
 
@@ -458,8 +516,8 @@ def main(
     # workflows / CI dashboards that key off it; multi-worker uses -rN suffixes.
     cluster_names = (
         [base_cluster_name]
-        if num_workers == 1
-        else [f"{base_cluster_name}-r{i}" for i in range(num_workers)]
+        if resolved_num_workers == 1
+        else [f"{base_cluster_name}-r{i}" for i in range(resolved_num_workers)]
     )
 
     rcs = _run_workers(
@@ -471,11 +529,13 @@ def main(
     )
 
     failed = [
-        (cluster_names[i], rcs[i]) for i in range(num_workers) if rcs[i] != _TAIL_LOGS_RC_SUCCESS
+        (cluster_names[i], rcs[i])
+        for i in range(resolved_num_workers)
+        if rcs[i] != _TAIL_LOGS_RC_SUCCESS
     ]
     if failed:
         raise click.ClickException(
-            f"{len(failed)} of {num_workers} worker(s) failed: "
+            f"{len(failed)} of {resolved_num_workers} worker(s) failed: "
             + ", ".join(f"{name}(rc={rc})" for name, rc in failed)
         )
 
