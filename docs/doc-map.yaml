@@ -75,8 +75,10 @@ docs:
         covers: "Dataset generation configs, shard counts, sample counts, synth params"
       - pattern: "pipeline/entrypoints/generate_dataset.py"
         covers: "Dataset generation entrypoint, sequential multi-shard MVP, CLI interface"
-      - pattern: ".github/workflows/dataset-generation.yml"
-        covers: "CI workflow steps, trigger conditions, artifact handling"
+      - pattern: ".github/workflows/generate-dataset-shards.yaml"
+        covers: "Reusable launcher fan-out across providers (skypilot-local kind, runpod, oci); per-provider artifact upload"
+      - pattern: ".github/workflows/validate-dataset-shards.yaml"
+        covers: "Reusable spec + shard validation downstream of generate-dataset-shards; consumes the run-metadata artifact"
       - pattern: "pipeline/ci/**"
         covers: "CI validation scripts, spec materialization, shard validation"
       - pattern: "pipeline/constants.py"
@@ -88,7 +90,7 @@ docs:
   - doc: docs/design/skypilot-compute-integration.md
     description: SkyPilot launcher for the data pipeline (RunPod + OCI smoke)
     sources:
-      - pattern: "pipeline/entrypoints/skypilot_launch_smoke.py"
+      - pattern: "pipeline/entrypoints/skypilot_launch.py"
         covers: "SkyPilot launcher CLI, materialize → upload-spec-to-R2 → launch flow, sky.launch (unmanaged) + down=True, --tail/--no-tail mode split (default --no-tail: _run_workers_detached waits for job_id per rank then prints sky logs/sky down commands and exits; --tail: _run_workers_tail invokes sky.tail_logs(follow=True) and tears down clusters in finally) with idle_minutes_to_autostop=5, down=True as the detached-mode safety net, per-cluster R2 spec key (skypilot-launcher-specs/<cluster>.json) — file_mounts deliberately avoided, see #749"
       - pattern: "configs/compute/runpod-template.yaml"
         covers: "SkyPilot Task YAML for RunPod: resources block, image_id injected per-launch by the launcher (`--worker-image-tag`, default `dev-snapshot`) via `_override_image_id`, env-var injection (RCLONE_CONFIG_R2_*), R2-URI spec contract (WORKER_SPEC_URI consumed by load_spec_from_uri in the worker)"
