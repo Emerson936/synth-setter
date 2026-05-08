@@ -1,6 +1,458 @@
 # CHANGELOG
 
 
+## v0.13.1 (2026-05-08)
+
+### Bug Fixes
+
+- **surge-interactive**: Bound _validate_metrics_df NaN/Inf error message
+  ([#857](https://github.com/tinaudio/synth-setter/pull/857),
+  [`6131e42`](https://github.com/tinaudio/synth-setter/commit/6131e42d91c23906d35535ac27058ed08e4f8bcc))
+
+* fix(surge-interactive): bound _validate_metrics_df NaN/Inf error message
+
+Re-lands the two surviving pieces of #836 onto current main (closing #836 as stale because most of
+  its diff is already on main).
+
+- ``_validate_metrics_df``: on NaN/Inf, report only the offending rows filtered to expected columns,
+  with a ``"N of M rows"`` count, instead of dumping the full metrics DataFrame. Keeps the
+  ``ValueError`` message bounded for large fixtures (a 1000-row metrics.csv with one bad row no
+  longer dumps a thousand lines into the traceback). - ``docs/design/eval-pipeline.md``: add a
+  Consumers section pointing at ``scripts/surge_xt_interactive.py --checkpoint-path …`` so readers
+  arrive at the eval pipeline doc with the right entry point. - New regression test
+  ``test_nan_error_reports_offending_row_count_not_full_df`` asserts the message references only
+  offending rows (not finite ones).
+
+Refs #844
+
+* perf(surge-interactive): hoist np.isfinite mask in _validate_metrics_df
+
+Compute np.isfinite(numeric) once and reuse the boolean array for both the .all() gate and the
+  per-row bad_mask, avoiding a redundant pass on the NaN/Inf failure path.
+
+Addresses Copilot review comment on PR #857
+  (https://github.com/tinaudio/synth-setter/pull/857#discussion_r3205047048).
+
+### Refactoring
+
+- **workflows**: Split test-dataset-generation; rename launcher
+  ([#858](https://github.com/tinaudio/synth-setter/pull/858),
+  [`8107727`](https://github.com/tinaudio/synth-setter/commit/81077272c042792a4441e6c11945529cf5f51878))
+
+* refactor(workflows): extract generate-dataset-shards.yaml; rename skypilot_launch_smoke
+
+Splits test-dataset-generation.yml into a thin wrapper plus two reusable workflows:
+
+* `generate-dataset-shards.yaml` — workflow_call only. Owns one provider's launcher invocation
+  (skypilot-local kind setup or runpod/oci in-container launcher). Inputs: provider, dataset_config,
+  image_tag, cluster_name, num_workers, tail, api_server, local, artifact_name. Becomes the official
+  launcher entry point that follow-up PRs (R2-as-coordination, expanded dispatch surface) build on.
+  * `validate-dataset-shards.yaml` — workflow_call only. Owns validate-spec + validate-shard jobs. *
+  `test-dataset-generation.yml` keeps PR/dispatch triggers (3 inputs unchanged) and computes the
+  provider matrix; calls the two reusables per provider. The docker-only `local` row stays inline
+  (no launcher).
+
+Also renames `pipeline/entrypoints/skypilot_launch_smoke.py` → `skypilot_launch.py` (and the
+  matching test) since the launcher is no longer smoke-specific. Updated all callers:
+  test-skypilot-debug.yml, test-dataset-generation.yml's paths filter, the compute templates' header
+  comments, scripts/sync_worker_checkout.sh, and the doc set.
+
+Deletes obsolete `dataset-generation.yml` (no callers, superseded by the unified launcher).
+
+Behavior-preserving — every flag the test wrapper passes to the reusable matches the value today's
+  inline blocks hardcoded (num_workers=1 + local=true for skypilot-local; defaults elsewhere).
+
+Refs #856
+
+* docs: fix stale dataset-generation.yml references after workflow split
+
+The doc-drift agent surfaced doc references to the deleted `dataset-generation.yml` workflow that
+  the rename pass missed. Updated four files:
+
+* docs/doc-map.yaml — replace the deleted-workflow pattern with the two new reusables
+  (generate-dataset-shards.yaml + validate-dataset-shards.yaml). * docs/reference/github-actions.md
+  — replace the `dataset-generation` row in the Pipeline catalog with rows for both new reusables;
+  refresh the dependency map; replace `dataset-generation` in the Used-by columns of the R2 + W&B
+  secrets table; update the runtime-secrets and mount-as-volume sections. *
+  docs/design/storage-provenance-spec.md — update the workflow table row to describe
+  `generate-dataset-shards.yaml` (with its actual input set) and add a sibling row for
+  `validate-dataset-shards.yaml`. * .github/workflows/test-vst-slow.yml — update the comment that
+  cites `dataset-generation.yml` as the headless-X11 proof point to point at
+  `generate-dataset-shards.yaml`.
+
+### Testing
+
+- **surge-interactive**: Convert TestRunPredict to inject _RecordingSubprocessRunner
+  ([#850](https://github.com/tinaudio/synth-setter/pull/850),
+  [`c169a1c`](https://github.com/tinaudio/synth-setter/commit/c169a1cf6fd047a0b87d3cf90404d96f9c41a9e1))
+
+Step 2 of #844. Replaces ``monkeypatch.setattr(surge_xt_interactive.subprocess, "check_call", ...)``
+  with direct injection of a hand-rolled ``_RecordingSubprocessRunner`` fake via the
+  ``subprocess_runner`` kwarg added in step 1 (commit c7630ee).
+
+The fake records every invocation's positional argv and kwargs; the test then asserts on
+  ``runner.calls[0]`` directly. No mock library, no module-level monkeypatching — the injected
+  dependency is the dependency the production code actually uses.
+
+``_RecordingSubprocessRunner`` is defined just before ``TestRunPredict`` and is reused by subsequent
+  migration steps (3, 6/7) that exercise the same seam from other test classes.
+
+Refs #844
+
+- **surge-interactive**: Step 3 — TestMaybeEvalCapturedPatches (#844)
+  ([#851](https://github.com/tinaudio/synth-setter/pull/851),
+  [`258784c`](https://github.com/tinaudio/synth-setter/commit/258784c398369ca413b2218718aa26fd881581eb))
+
+* test(scripts): convert TestMaybeEvalCapturedPatches to fakes + real IsADirectoryError
+
+Step 3 of #844. Drops the last three monkeypatches in this test class and replaces them with direct
+  fake injection plus a real OS-level error trigger:
+
+- New ``_RecordingEvalRunner`` (10 LoC) records every invocation of the ``eval_runner`` seam added
+  in step 1. Replaces both ``monkeypatch.setattr(surge_xt_interactive, "eval_patches", ...)`` calls
+  in this class.
+
+- The rollback test (``test_failed_copy_rolls_back_partial_siblings``) no longer monkeypatches
+  ``shutil.copyfile`` with a flaky stub. Instead it pre-creates ``val.h5`` as a *directory* — the
+  second copy then raises a real ``IsADirectoryError`` (a portable subclass of ``OSError``).
+  ``test.h5`` is rolled back; ``val.h5`` remains as the pre-existing directory, which the assertion
+  verifies via ``.is_dir()`` rather than the (now-incorrect) ``not exists()``.
+
+Why ``IsADirectoryError`` over chmod-readonly: chmod-based failures behave differently on Windows;
+  ``IsADirectoryError`` is portable and exercises the same rollback contract.
+
+The third existing test (``test_no_checkpoint_skips_replication_and_eval``) already had no
+  monkeypatch but now passes the recording runner so the ``runner.calls == []`` assertion can prove
+  eval was *not* invoked.
+
+Refs #844
+
+* monitoring(surge-interactive): broaden _RecordingEvalRunner docstring (#844 review nit)
+
+Copilot pointed out the docstring said the fake is reused by "two" TestMaybeEvalCapturedPatches
+  tests, but it's actually used in three (no-checkpoint, replication, rollback). Reworded to "across
+  TestMaybeEvalCapturedPatches whenever a test needs to observe whether eval was invoked" — accurate
+  and stable as more tests are added.
+
+Refs #844 (Copilot #3204710746)
+
+* test(scripts): assert OSError in rollback test to match SUT contract (#844 review nit)
+
+The SUT's `_maybe_eval_captured_patches` catches `except OSError:` as the rollback trigger, so
+  asserting the parent class matches the actual contract. Pinning the specific subclass
+  `IsADirectoryError` couples the test to one platform's exception variant — on Windows, opening a
+  directory for writing raises `PermissionError`. Both are `OSError` subclasses; the SUT does not
+  distinguish.
+
+The behavioral assertions (rollback removed test.h5, val.h5 still a dir, predict.h5 not created,
+  runner.calls == []) remain the real test contract and verify the right code path was hit.
+
+Addresses https://github.com/tinaudio/synth-setter/pull/851#discussion_r3204826363
+
+- **surge-interactive**: Step 4 — TestMidiListener (#844)
+  ([#852](https://github.com/tinaudio/synth-setter/pull/852),
+  [`1a15b23`](https://github.com/tinaudio/synth-setter/commit/1a15b2399c939e6a9b6ad5d802841f6f09f98194))
+
+* test(scripts): convert TestMidiListener to inject port_opener directly
+
+Step 4 of #844. Drops both ``monkeypatch.setattr(surge_xt_interactive.mido, "open_input", ...)``
+  calls and the manual ``mido.open_input = ...`` swap in ``TestMidiListener``, replacing them with
+  direct ``port_opener=`` kwarg injection via the seam added in step 1.
+
+- ``test_only_relevant_message_types_are_forwarded`` builds the fake port inside a small
+  ``fake_port_opener`` closure passed to the listener thread via ``kwargs={"port_opener":
+  fake_port_opener}``. - ``test_stop_event_exits_listener_with_no_messages`` no longer mutates the
+  module's ``mido.open_input`` attribute — the inline lambda is passed straight as ``port_opener=``.
+  - ``test_open_input_failure_logs_and_exits_thread`` follows the same pattern: the raising callable
+  is passed directly. The pytest ``MonkeyPatch`` fixture is dropped from the signature.
+
+Refs #844
+
+* monitoring(surge-interactive): cleanup listener thread in failure paths (#844 review)
+
+Copilot's suppressed-low-confidence finding on PR #852: when
+  ``test_only_relevant_message_types_are_forwarded`` started the listener thread as non-daemon, a
+  failure of ``drain_event.wait(timeout=2.0)`` (or any earlier exception) would leave the listener
+  running and the ``join`` skipped — pytest could hang at shutdown waiting for it.
+
+Two-part fix:
+
+1. ``daemon=True`` on the listener thread so the worst case is "thread reaped at process exit"
+  rather than "test hangs the runner". 2. ``try/finally`` around the drain-event assertion so
+  ``stop_event.set()`` and ``listener_thread.join()`` always run, even if the assertion fails.
+
+Belt-and-suspenders — either change alone would prevent the hang, but the combination keeps the test
+  self-cleaning *and* makes the daemon behavior obvious to a reader.
+
+Refs #844 (Copilot suppressed-low-confidence finding on #852)
+
+* monitoring(surge-interactive): reword test comment per #852 review nit
+
+drain_event lives in the test body, not in a fixture, so the "fixture-side" qualifier in the
+  daemon-thread rationale comment points the reader at the wrong place when debugging a failure.
+
+- **surge-interactive**: Step 5 — TestPlayAudioQueueDrain (#844)
+  ([#853](https://github.com/tinaudio/synth-setter/pull/853),
+  [`36c8e74`](https://github.com/tinaudio/synth-setter/commit/36c8e7463f9676ac00e3e0721df62a7cdf1e7775))
+
+* test(scripts): convert TestMidiListener to inject port_opener directly
+
+Step 4 of #844. Drops both ``monkeypatch.setattr(surge_xt_interactive.mido, "open_input", ...)``
+  calls and the manual ``mido.open_input = ...`` swap in ``TestMidiListener``, replacing them with
+  direct ``port_opener=`` kwarg injection via the seam added in step 1.
+
+- ``test_only_relevant_message_types_are_forwarded`` builds the fake port inside a small
+  ``fake_port_opener`` closure passed to the listener thread via ``kwargs={"port_opener":
+  fake_port_opener}``. - ``test_stop_event_exits_listener_with_no_messages`` no longer mutates the
+  module's ``mido.open_input`` attribute — the inline lambda is passed straight as ``port_opener=``.
+  - ``test_open_input_failure_logs_and_exits_thread`` follows the same pattern: the raising callable
+  is passed directly. The pytest ``MonkeyPatch`` fixture is dropped from the signature.
+
+Refs #844
+
+* monitoring(surge-interactive): cleanup listener thread in failure paths (#844 review)
+
+Copilot's suppressed-low-confidence finding on PR #852: when
+  ``test_only_relevant_message_types_are_forwarded`` started the listener thread as non-daemon, a
+  failure of ``drain_event.wait(timeout=2.0)`` (or any earlier exception) would leave the listener
+  running and the ``join`` skipped — pytest could hang at shutdown waiting for it.
+
+Two-part fix:
+
+1. ``daemon=True`` on the listener thread so the worst case is "thread reaped at process exit"
+  rather than "test hangs the runner". 2. ``try/finally`` around the drain-event assertion so
+  ``stop_event.set()`` and ``listener_thread.join()`` always run, even if the assertion fails.
+
+Belt-and-suspenders — either change alone would prevent the hang, but the combination keeps the test
+  self-cleaning *and* makes the daemon behavior obvious to a reader.
+
+Refs #844 (Copilot suppressed-low-confidence finding on #852)
+
+* monitoring(surge-interactive): reword test comment per #852 review nit
+
+drain_event lives in the test body, not in a fixture, so the "fixture-side" qualifier in the
+  daemon-thread rationale comment points the reader at the wrong place when debugging a failure.
+
+* test(scripts): convert TestPlayAudioQueueDrain to direct fake injection + stop-after-N plugin
+
+Step 5 of #844. Drops the last batch of monkeypatches in this test class: three
+  ``monkeypatch.setattr(surge_xt_interactive, "AudioStream", _AudioStreamStub)`` calls and three
+  ``monkeypatch.setattr(plugin, "process", _stop_after_first_buffer)`` re-binds.
+
+Two changes make this possible:
+
+1. ``_RecordingPlugin`` now accepts ``stop_event`` and ``stop_after_n_calls`` as constructor kwargs.
+  Its ``process()`` method flips ``stop_event`` after the Nth invocation, so ``play_audio`` exits
+  its loop deterministically without anyone re-binding the bound method on the instance.
+
+2. Each test passes a tiny ``audio_stream_factory=lambda: stream`` to ``play_audio`` instead of
+  monkey-patching the module's ``AudioStream`` attribute. The dropped ``_AudioStreamStub`` was a
+  workaround for the class-attribute lookup ``AudioStream.default_output_device_name`` — no longer
+  needed because the production default factory (``_default_audio_stream_factory``) does that lookup
+  itself, and only when the seam is left at its default.
+
+The ``default_output_device_name`` class attribute is removed from ``_FakeStream`` for the same
+  reason — it was only there to satisfy the old stub class.
+
+The new tests are strictly more state-based: each one asserts on ``stop_event.is_set()`` after the
+  call returns, plus the plugin's ``messages_per_call`` and the stream's ``writes`` list (where
+  relevant).
+
+- **surge-interactive**: Step 6 — extract pure helpers (#844)
+  ([#854](https://github.com/tinaudio/synth-setter/pull/854),
+  [`dead3ca`](https://github.com/tinaudio/synth-setter/commit/dead3ca928c663d9805366a18c4ba1a5d8d30424))
+
+* test(scripts): convert TestMidiListener to inject port_opener directly
+
+Step 4 of #844. Drops both ``monkeypatch.setattr(surge_xt_interactive.mido, "open_input", ...)``
+  calls and the manual ``mido.open_input = ...`` swap in ``TestMidiListener``, replacing them with
+  direct ``port_opener=`` kwarg injection via the seam added in step 1.
+
+- ``test_only_relevant_message_types_are_forwarded`` builds the fake port inside a small
+  ``fake_port_opener`` closure passed to the listener thread via ``kwargs={"port_opener":
+  fake_port_opener}``. - ``test_stop_event_exits_listener_with_no_messages`` no longer mutates the
+  module's ``mido.open_input`` attribute — the inline lambda is passed straight as ``port_opener=``.
+  - ``test_open_input_failure_logs_and_exits_thread`` follows the same pattern: the raising callable
+  is passed directly. The pytest ``MonkeyPatch`` fixture is dropped from the signature.
+
+Refs #844
+
+* monitoring(surge-interactive): cleanup listener thread in failure paths (#844 review)
+
+Copilot's suppressed-low-confidence finding on PR #852: when
+  ``test_only_relevant_message_types_are_forwarded`` started the listener thread as non-daemon, a
+  failure of ``drain_event.wait(timeout=2.0)`` (or any earlier exception) would leave the listener
+  running and the ``join`` skipped — pytest could hang at shutdown waiting for it.
+
+Two-part fix:
+
+1. ``daemon=True`` on the listener thread so the worst case is "thread reaped at process exit"
+  rather than "test hangs the runner". 2. ``try/finally`` around the drain-event assertion so
+  ``stop_event.set()`` and ``listener_thread.join()`` always run, even if the assertion fails.
+
+Belt-and-suspenders — either change alone would prevent the hang, but the combination keeps the test
+  self-cleaning *and* makes the daemon behavior obvious to a reader.
+
+Refs #844 (Copilot suppressed-low-confidence finding on #852)
+
+* monitoring(surge-interactive): reword test comment per #852 review nit
+
+drain_event lives in the test body, not in a fixture, so the "fixture-side" qualifier in the
+  daemon-thread rationale comment points the reader at the wrong place when debugging a failure.
+
+* test(scripts): convert TestPlayAudioQueueDrain to direct fake injection + stop-after-N plugin
+
+Step 5 of #844. Drops the last batch of monkeypatches in this test class: three
+  ``monkeypatch.setattr(surge_xt_interactive, "AudioStream", _AudioStreamStub)`` calls and three
+  ``monkeypatch.setattr(plugin, "process", _stop_after_first_buffer)`` re-binds.
+
+Two changes make this possible:
+
+1. ``_RecordingPlugin`` now accepts ``stop_event`` and ``stop_after_n_calls`` as constructor kwargs.
+  Its ``process()`` method flips ``stop_event`` after the Nth invocation, so ``play_audio`` exits
+  its loop deterministically without anyone re-binding the bound method on the instance.
+
+2. Each test passes a tiny ``audio_stream_factory=lambda: stream`` to ``play_audio`` instead of
+  monkey-patching the module's ``AudioStream`` attribute. The dropped ``_AudioStreamStub`` was a
+  workaround for the class-attribute lookup ``AudioStream.default_output_device_name`` — no longer
+  needed because the production default factory (``_default_audio_stream_factory``) does that lookup
+  itself, and only when the seam is left at its default.
+
+The ``default_output_device_name`` class attribute is removed from ``_FakeStream`` for the same
+  reason — it was only there to satisfy the old stub class.
+
+The new tests are strictly more state-based: each one asserts on ``stop_event.is_set()`` after the
+  call returns, plus the plugin's ``messages_per_call`` and the stream's ``writes`` list (where
+  relevant).
+
+* internal-fix(scripts): extract pure helpers from _render_predicted_audio
+
+Step 6 of #844. Splits ``_render_predicted_audio`` into three:
+
+- ``_build_predict_vst_audio_argv(predictions_dir, audio_dir, spec, preset) -> list[str]`` — argv
+  construction only. Pure function. Raises ``FileNotFoundError`` on Linux when the headless VST
+  wrapper is absent. - ``_validate_rendered_audio_dir(audio_dir, num_samples) -> None`` —
+  post-render directory + artifact + non-silent-WAV checks. Pure function over the filesystem;
+  raises ``FileNotFoundError`` / ``ValueError``. - ``_render_predicted_audio`` is now a thin
+  orchestrator: build argv, invoke the subprocess, call the validator. ``subprocess.TimeoutExpired``
+  logging is preserved.
+
+Production behavior is unchanged. The two pure helpers exist so step 7 can replace the eight
+  ``TestRenderPredictedAudio`` monkeypatch-and-prepopulate tests with a tight set of state-based
+  unit tests (against real ``tmp_path`` fixtures for the validator) plus an e2e test gated on
+  ``requires_vst``.
+
+The extracted helpers are reused by the orchestrator so that production exercises the exact same
+  code paths the unit tests do — no parallel implementations.
+
+* monitoring(surge-interactive): fix lexical-sort bug in _validate_rendered_audio_dir
+
+``_validate_rendered_audio_dir`` (extracted from ``_render_predicted_audio`` in commit c79a0ba on
+  this branch) compared sample-dir names with ``sorted()``, which is lexical: for ``num_samples >=
+  10``, the actual list ``[sample_0, sample_1, sample_10, sample_11, sample_2, ...]`` would mismatch
+  the expected ``[sample_0, sample_1, sample_2, ..., sample_11]`` even when every directory existed.
+
+Fix: compare actual vs expected as sets (order-independent), then iterate ``range(num_samples)`` to
+  walk each sample dir by index. The error message now reports ``missing=`` and ``extra=``
+  separately, which is more useful than the previous "got vs expected" full-list dump.
+
+The bug pre-dated step 6's extraction but is in the new function I introduced, so fixing it here
+  keeps the code clean before step 7 lands e2e tests against the ``surge_xt_smoke_datasets`` fixture
+  (5 samples today, but an upcoming larger fixture would have hit this).
+
+Verified at runtime with ``num_samples=12``: pre-fix raised ``FileNotFoundError``; post-fix passes
+  cleanly.
+
+Refs #844 (Copilot suppressed-low-confidence finding on PR #854)
+
+* docs(surge-interactive): reword "Pure function" helper docstrings
+
+Copilot's review on PR #854 flagged that ``_build_predict_vst_audio_argv`` is documented as a "Pure
+  function" but on Linux it does ``_VST_HEADLESS_WRAPPER.is_file()`` and reads ``sys.platform``.
+  Reword both extracted helpers (and the orchestrator's reference to them) to describe their actual
+  side-effect surface — no subprocess, no writes — instead of overstating purity, so step-7's tests
+  don't lean on a strict-purity assumption.
+
+- **surge-interactive**: Step 7+8 — re-land collapsed TestRenderPredictedAudio + TestKeyboardLoop
+  seam (#844) ([#859](https://github.com/tinaudio/synth-setter/pull/859),
+  [`bfdfe3b`](https://github.com/tinaudio/synth-setter/commit/bfdfe3b95bb2571ca53169b046df0803d39739fb))
+
+* test(scripts): collapse TestRenderPredictedAudio into pure-helper unit tests + e2e (#855)
+
+Step 7 of #844 de-mock refactor. Removes the last `monkeypatch.setattr(surge_xt_interactive...)`
+  calls from the test file by:
+
+- Adding `platform` / `wrapper_path` kwargs to `_build_predict_vst_audio_argv` so unit tests no
+  longer need to monkeypatch `sys.platform` or the module-level wrapper constant. Defaults
+  late-bind, so production behavior is unchanged. - Replacing 10 `TestRenderPredictedAudio`
+  mock-heavy tests with three pure-state classes: `TestBuildPredictVstAudioArgv` (5 argv-shape
+  tests), `TestValidateRenderedAudioDir` (6 state tests including the `num_samples=12` regression
+  for the lex-sort fix), and `TestRenderPredictedAudioSubprocessIntegration` (1 orchestrator test
+  driven by `_RecordingSubprocessRunner`). - Adding `TestPlayAudioRecordedE2E` and
+  `TestRenderPredictedAudioE2E` gated `@requires_vst @slow` — real Surge XT plugin + real
+  `predict_vst_audio.py` subprocess against synthetic `pred-{i}.pt` rows, asserting non-silent WAV
+  output for every per-sample artifact. - Deleting
+  `test_subprocess_failure_raises_calledprocesserror` and
+  `test_subprocess_timeout_re_raises_timeoutexpired` (stdlib re-raise, not our contract).
+
+Refs #844
+
+* test(scripts): add keystroke_source seam to keyboard_loop + TestKeyboardLoop
+
+Step 8 of #844 de-mock refactor. Adds the last DI seam needed to exercise ``keyboard_loop``
+  deterministically without spawning a TTY, plus 5 state-based unit tests and 1 ``@requires_vst
+  @slow`` e2e test.
+
+## Production change
+
+``keyboard_loop`` accepts a new keyword-only ``keystroke_source: KeystrokeSource | None`` that
+  defaults to ``None`` (reads ``click.getchar`` lazily — same as before, monkeypatch compat
+  preserved). When supplied, the loop polls the callable instead and treats ``StopIteration`` as
+  quit (sets ``stop_event`` and returns recorded patches).
+
+Tests pass ``iter([...]).__next__`` for a concrete deterministic key sequence; the e2e test drives
+  the real Surge XT plugin with ``["p", "q"]`` and asserts a finite patch dict matching
+  ``surge_simple``'s synth_param_names.
+
+## Test changes
+
+New ``TestKeyboardLoop`` (5 tests, all state-based, no monkeypatch):
+
+- ``test_p_records_patch_q_quits`` — happy path: one patch, all spec keys present with finite
+  floats, ``stop_event`` set - ``test_unknown_keys_are_ignored`` — ``["x", "p", "z", "q"]`` → 1
+  patch - ``test_stop_event_set_externally_exits_without_consuming_source`` — already-set
+  ``stop_event`` returns ``[]`` immediately; source is never polled -
+  ``test_source_exhaustion_quits_gracefully_and_sets_stop_event`` — ``["p"]`` (no q) returns 1 patch
+  and sets ``stop_event`` via the new ``StopIteration`` path -
+  ``test_drift_during_record_raises_valueerror_and_sets_stop_event`` — non-spec param drifted →
+  ``_validate_no_drift`` raises ``ValueError``; loop sets ``stop_event`` and re-raises
+
+New ``TestKeyboardLoopE2E`` (``@requires_vst @slow``):
+
+- ``test_p_q_against_real_plugin_records_one_patch`` — real Surge XT + ``surge-base.vstpreset``,
+  deterministic ``["p", "q"]``, asserts one patch with every ``surge_simple`` synth-param key as a
+  finite float
+
+* test(surge-interactive): fix synthetic target-audio shape for spectrogram path
+
+`predict_vst_audio.py` loads `target-audio-{i}.pt` unconditionally and indexes `target_audio[j]` for
+  spectrogram generation even with `-t`/`--rerender_target`, so a scalar synthetic tensor would
+  error inside `make_spectrogram` once the VST is available and the e2e test actually runs.
+
+Write `target-audio-{i}.pt` with shape (batch, channels, frames) matching the script's CLI defaults
+  (channels=2, sample_rate=44100, signal_duration_seconds= 4.0). Contents stay silent — only the
+  post-render pred/target WAVs are checked for non-silence.
+
+* test(surge-interactive): pin TestRenderPredictedAudioE2E to num_samples=1
+
+Surge XT exhibits sample-dependent silence past the first render when the input pred rows are
+  identical zeros (plugin-state leak across the reload+preset+flush cycle in render_params, even
+  though the plugin is reloaded each call). The e2e test's promise is "the predict → render →
+  validate chain works end-to-end against the real subprocess", which one sample proves; the
+  lex-sort regression that motivated num_samples >= 10 is already covered by the unit suite's
+  test_num_samples_12_does_not_trip_lex_sort.
+
+
 ## v0.13.0 (2026-05-07)
 
 ### Features
