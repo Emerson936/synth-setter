@@ -1,16 +1,10 @@
 """Spec-driven generate_dataset runner.
 
-Public API:
-    load_spec_from_uri(uri): Parse a DatasetSpec from a local path or r2:// URI.
-    run(spec): Full flow — upload spec to R2, generate shard, upload shard to R2.
-    run(spec): Full flow — upload spec to R2 once, then loop over
-        ``spec.shards`` rendering and uploading each.
-    build_generate_args(spec, shard, output_dir): Build CLI args for
-        src/data/vst/generate_vst_dataset.py.
+``main(cfg)`` is the Hydra-composed CLI entry, invoked via
+``python -m pipeline.entrypoints.generate_dataset experiment=<id>``.
 
-This module is no longer invocable via ``python -m``; the container's CLI
-entrypoint (``scripts/docker_entrypoint.py generate_dataset --spec <path-or-uri>``)
-parses the spec and calls ``run(spec)`` in-process.
+The click CLI in ``scripts/docker_entrypoint.py`` is the SkyPilot-worker entry that reads a
+pre-materialized spec from R2 via ``load_spec_from_uri``.
 """
 
 from __future__ import annotations
@@ -19,14 +13,29 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
+import hydra
+import rootutils
 from loguru import logger
+from omegaconf import DictConfig, OmegaConf
 
-from pipeline import r2_io
-from pipeline.constants import INPUT_SPEC_FILENAME
-from pipeline.partitioning import get_my_shards, read_rank_world_from_env
-from pipeline.schemas.spec import DatasetSpec, ShardSpec
-from src.data.vst.core import extract_renderer_version
+# Set PROJECT_ROOT env var and add the repo root to sys.path so
+# ``configs/paths/default.yaml``'s ``root_dir: ${oc.env:PROJECT_ROOT}`` interpolation
+# resolves under ``python -m pipeline.entrypoints.generate_dataset``. Mirrors
+# ``src/train.py`` / ``src/eval.py``.
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+
+from pipeline import r2_io  # noqa: E402
+from pipeline.constants import INPUT_SPEC_FILENAME  # noqa: E402
+from pipeline.partitioning import get_my_shards, read_rank_world_from_env  # noqa: E402
+from pipeline.schemas.spec import DatasetSpec, ShardSpec  # noqa: E402
+from src.data.vst.core import extract_renderer_version  # noqa: E402
+
+# Composed-config keys that aren't DatasetSpec fields: ``data`` / ``r2`` are interpolation
+# sources for top-level keys; ``paths`` / ``hydra`` exist only for Hydra runtime; ``run_name``
+# is a Hydra-output-dir interpolation source (see ``configs/dataset.yaml``).
+_NON_SPEC_KEYS: tuple[str, ...] = ("data", "r2", "paths", "hydra", "run_name")
 
 
 def load_spec_from_uri(spec_uri: str) -> DatasetSpec:
@@ -234,8 +243,25 @@ def _render_and_upload_shard(
     logger.info(f"shard removed locally: {shard_path}")
 
 
+def _spec_from_cfg(cfg: DictConfig) -> DatasetSpec:
+    """Build a DatasetSpec from a Hydra-composed cfg.
+
+    Resolves all interpolations, drops the non-DatasetSpec sub-trees, and constructs the model.
+    Raises if the composed config is not a mapping.
+    """
+    raw: Any = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(raw, dict):
+        raise TypeError(f"composed config is not a mapping: {type(raw).__name__}")
+    for key in _NON_SPEC_KEYS:
+        raw.pop(key, None)
+    return DatasetSpec(**raw)
+
+
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="dataset")
+def main(cfg: DictConfig) -> None:
+    """Hydra-composed CLI entry: ``python -m pipeline.entrypoints.generate_dataset experiment=<id>``."""
+    run(_spec_from_cfg(cfg))
+
+
 if __name__ == "__main__":
-    raise SystemExit(
-        "pipeline.entrypoints.generate_dataset is no longer invocable via `python -m`. "
-        "Use `scripts/docker_entrypoint.py generate_dataset --spec <path>` instead."
-    )
+    main()
