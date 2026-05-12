@@ -1,6 +1,563 @@
 # CHANGELOG
 
 
+## v2.0.0 (2026-05-12)
+
+### Chores
+
+- **act**: Runbook + .actrc + CI smoke for running workflows locally with act
+  ([#920](https://github.com/tinaudio/synth-setter/pull/920),
+  [`d7fa4e6`](https://github.com/tinaudio/synth-setter/commit/d7fa4e68cb9818c166c49c2595468fd21fe48931))
+
+* docs(operations): runbook for running GHA workflows locally with act
+
+Adds docs/operations/running-workflows-locally.md covering act prerequisites, .env-as-secrets
+  handling (including the GIT_PAT→GITHUB_TOKEN rename and the secret-file vs -s flag gotcha for
+  GITHUB_TOKEN), --bind vs default copy behavior, the worktree .git resolution caveat, synthetic
+  pull_request events, and per-workflow examples for code-quality-pr / pr-metadata-gate /
+  check-auth.
+
+Ships docs/operations/act-runner.Dockerfile — a thin layer over catthehacker/ubuntu:act-latest that
+  installs the gh CLI from the official apt repo, since the default catthehacker image omits gh and
+  any workflow that shells out to `gh api`/`gh pr view` fails with command-not-found.
+
+Cross-refs the new guide from docs/reference/github-actions.md so the existing workflow catalog
+  points readers to the local-run runbook.
+
+Refs #915
+
+* docs(operations): correct the `-s GITHUB_TOKEN` propagation note
+
+Verification against PR #920 showed that act -s "GITHUB_TOKEN=$(gh auth token)" propagates
+  secrets.GITHUB_TOKEN correctly. The earlier failure behind the original "does not always
+  propagate" note was a bash-evaluation trap (KEY=value cmd "$KEY" expands $KEY in the parent shell
+  where it's still unset), not an act-side limitation. Rewrite the gotcha section to document the
+  actual shell pitfall with concrete WRONG / OK examples.
+
+* docs(operations): address Copilot review feedback on #920
+
+- actrc snippet: add `ubuntu-latest-4core` mapping. The repo uses that label in cpu-slow,
+  docker-build-validation, and test-vst-slow; without a mapping, act prompts (or fails on EOF in
+  non-TTY) on first run of those workflows.
+
+- GITHUB_TOKEN section: pivot away from `.env`'s `GIT_PAT` (not documented in `.env.example`) toward
+  `gh auth token` as the primary path, with a documented fallback for `RESTRICTED_AGENT_GIT_PAT` —
+  the token name actually shipped in `.env.example`.
+
+- Dockerfile: replace `curl … | tee … >/dev/null` with `curl -fsSL -o <dest>`. Avoiding the pipe
+  means `set -e` actually catches a failed curl; with the pipe under Docker's default `/bin/sh`, a
+  curl failure can be masked by a successful tee, which makes layer-build failures harder to
+  diagnose.
+
+Copilot also flagged a `||` (double-pipe) table-rendering bug on running-workflows-locally.md line
+  266 — false positive; the table starts with single `|` in both the reviewed commit (3154b3d) and
+  HEAD. Replying inline with the source quote.
+
+* ci(act): commit .actrc + test-act.yaml regression guard
+
+Ships the act runner-label mappings as a checked-in .actrc at the repo root so every contributor
+  gets the same medium catthehacker images without hand-rolling ~/.config/act/actrc. Mappings cover
+  ubuntu-latest, ubuntu-latest-4core, ubuntu-22.04, and ubuntu-20.04 — every label the repo's
+  workflows actually use today.
+
+Adds .github/workflows/test-act.yaml: a small regression guard that runs on PRs touching .actrc, the
+  runner Dockerfile, or itself. It installs a pinned act release, parses every workflow via `act -l`
+  (which also honors .actrc), dry-runs pr-metadata-gate.yaml, builds the documented
+  docs/operations/act-runner.Dockerfile with --no-cache, and dry-runs again with the resulting
+  gh-enabled image — so config rot is caught at PR time instead of on someone's laptop.
+  Concurrency-grouped so re-pushes cancel the in-flight run.
+
+Updates the runbook to reference the committed .actrc and the new CI guard instead of the per-user
+  ~/.config/act/actrc that's now redundant.
+
+* ci(act): extend test-act guard to the data-pipeline workflow chain
+
+test-dataset-generation.yml uses a dynamic matrix (`fromJSON(needs.setup.outputs.providers)`) that
+  act can't evaluate at dry-run time, so target `-j setup` (the orchestrator entry point where new
+  bash/python lands) and dry-run each called `workflow_call` reusable directly. Together those cover
+  the parse-chain test-dataset-generation flows through.
+
+Also expands the `paths:` trigger to include the three data-pipeline workflow files so changes to
+  any of them re-run this guard.
+
+* docs(operations): address Copilot review round 2 on #920
+
+- test-act.yaml header: the old wording oversold the trigger scope ("any workflow YAML drifts"); the
+  actual `paths:` is the .actrc / Dockerfile / this guard / the data-pipeline workflow chain.
+  Tightened the comment to match.
+
+- running-workflows-locally.md: replace U+2026 ellipses inside inline code spans and bash code
+  blocks with ASCII `...`. The Unicode character is hostile to copy/paste — bash treats it as a
+  literal arg, not a placeholder. Bash gotcha examples now use concrete `act pull_request -W ...`
+  invocations so the WRONG/OK pairs are runnable as written.
+
+The third comment in this round flagged `\|` rendering inside a code span inside a GFM table;
+  verified via GitHub's /markdown API that the rendered output is the expected `<code>... | xargs
+  ...</code>` (false positive, replying inline with the rendered HTML).
+
+* ci(act): install act from pinned tarball + checksum
+
+Previously this step piped `install.sh` from nektos/act master into sudo bash. ACT_VERSION was
+  pinned but the install.sh wasn't — master can drift or be tampered with, which is a supply-chain
+  risk and means CI could start failing unexpectedly without any change on our side.
+
+Download the tagged release tarball directly, verify against the official sha256, and untar to
+  /usr/local/bin. Both ACT_VERSION and ACT_SHA256 live adjacent in env so bumps are atomic.
+
+* ci(act): real-run test-dataset-generation via act after dry-run
+
+The dry-run-only coverage couldn't exercise the dynamic matrix
+  `fromJSON(needs.setup.outputs.providers_*)` because `act -n` skips setup's bash and leaves the
+  output empty. Add a real-run step (no `-n`) that invokes `act workflow_dispatch -W
+  test-dataset-generation.yml --input provider=local`, scoping to the inline `generate-local` path
+  (no SkyPilot launcher, no cloud creds beyond R2). Setup runs, populates outputs, and the matrix
+  resolves naturally — covering matrix-evaluation, docker-in-act-runner, and the R2 secret
+  passthrough.
+
+Fork PRs skip the step at the step-level `if:` because `secrets.RCLONE_CONFIG_R2_*` aren't exposed
+  to forks. Bump `timeout-minutes` 10 -> 30 to absorb the dev-snapshot image pull (~3 GB) and the
+  smoke shard generation.
+
+Also drop the three data-pipeline workflow paths from test-act's `on.pull_request.paths:` — those
+  workflows are already exercised natively by test-dataset-generation when they change, so including
+  them here doubled the work. The act regression guard keeps firing on `.actrc`, the runner
+  Dockerfile, and test-act.yaml itself, which are the contracts that actually affect `act`
+  correctness.
+
+* docs(operations): address Copilot review round 3 on #920
+
+- act-runner.Dockerfile: switch DEBIAN_FRONTEND from ARG to ENV so it actually applies to the
+  apt-get RUN steps (ARG without a matching ENV has no effect on RUN env in modern Docker). -
+  test-act.yaml: rename the "List workflows" step from "every .yml" to "every .yml/.yaml" — the repo
+  has both extensions. - running-workflows-locally.md: add a Known-limitations row for runs-on:
+  gpu-x64 (test-gpu.yml), matching the existing macOS row.
+
+* ci(act): inject PIP_BREAK_SYSTEM_PACKAGES into the real-run via --env
+
+The real-run step added in 3025216 surfaced a genuine act-vs-GHA divergence:
+  catthehacker/ubuntu:act-latest's python3.12 ships with PEP 668's externally-managed marker, so
+  `pip install hydra-core ...` in test-dataset-generation's setup job fails under act with `error:
+  externally-managed-environment`. GitHub-hosted runners don't have the marker so production CI is
+  unaffected.
+
+Pass `--env PIP_BREAK_SYSTEM_PACKAGES=1` to act so the inner workflow's pip invocations override PEP
+  668 without modifying test-dataset-generation.yml itself.
+
+* ci(act): widen verify-act paths to fire on data-pipeline workflow edits
+
+The header comment claimed the guard fires when the data-pipeline workflows the guard dry-runs
+  (test-dataset-generation, generate-dataset-shards, validate-dataset-shards) drift, but the actual
+  paths filter only listed the act setup files. Add the three workflow paths so a future edit that
+  breaks act parsing or matrix evaluation surfaces here, before merge, instead of during the next
+  pipeline run.
+
+Addresses Copilot review comment 3229887381 on PR #920.
+
+* ci(act): bind /tmp + start artifact server so real-run completes
+
+The first real-run on 83f41a3 cleared setup (PIP_BREAK fix) but generate-local then surfaced two
+  more act-vs-GHA divergences:
+
+* "Validate spec exists" failed: generate-local mkdir's /tmp/run-metadata-local inside the act
+  runner container, then does a host-daemon `docker run -v /tmp/run-metadata-local:/run-metadata`.
+  The bind-mount uses the host's namespace, so the spec lands on the host. The subsequent in-runner
+  stat (runner namespace) sees nothing.
+
+* "Upload run metadata" failed: actions/upload-artifact@v4 needs `ACTIONS_RUNTIME_TOKEN`, which act
+  issues only when its local artifact server is enabled.
+
+Both are act invocation knobs — no change to test-dataset-generation:
+
+* `--container-options "-v /tmp:/tmp"` shares /tmp between act runner and host so the in-runner stat
+  and the host-daemon mount agree. * `--artifact-server-path "$artifact_dir"` boots act's built-in
+  artifact server (tempdir cleaned via the same trap as secrets_file).
+
+The real-run already proved end-to-end functional coverage on the prior attempt: dev-snapshot
+  pulled, VST gen ran, spec uploaded to R2, validate-dataset-shards consumed it from R2
+  successfully. These two flags just stop the act-only sanity steps from failing the overall act
+  exit code.
+
+- **lint**: Clean up src/utils/pylogger.py
+  ([#986](https://github.com/tinaudio/synth-setter/pull/986),
+  [`80b89ce`](https://github.com/tinaudio/synth-setter/commit/80b89cef0cce8e1c8ed782f081e825f8644a8c77))
+
+Remove src/utils/pylogger.py from the [tool.pydoclint] exclude list in pyproject.toml and add the
+  missing :raises: section and corrected :param: entries for *args/**kwargs on RankedLogger.log so
+  it satisfies pydoclint DOC103/DOC501/DOC503.
+
+No functional changes. Refs #25.
+
+- **lint**: Clean up tests/helpers/package_available.py
+  ([#979](https://github.com/tinaudio/synth-setter/pull/979),
+  [`43c940e`](https://github.com/tinaudio/synth-setter/commit/43c940efdfbd31d8beee56d76af651421f3a5e60))
+
+The file was excluded from `pyright` historically but is already clean under the current type-stubs:
+  it has a docstring, type-annotated helper, and well-typed module-level constants. `pyright` runs
+  cleanly on it once unexcluded.
+
+- `.pre-commit-config.yaml`: drop `tests/helpers/package_available\.py` from the `pyright` `exclude`
+  regex.
+
+No source edits required; no behavioural change. `pre-commit run --files
+  tests/helpers/package_available.py` passes all hooks (including the newly-enabled `pyright`);
+  `make test-fast` is green (556 passed, 5 skipped, 25.6s).
+
+Refs #25
+
+### Continuous Integration
+
+- **docs**: Merge benchmark chart into Pages deploy (Phase 2 follow-up)
+  ([#980](https://github.com/tinaudio/synth-setter/pull/980),
+  [`6790be9`](https://github.com/tinaudio/synth-setter/commit/6790be99678427887240425cfa7e0a01a51f133a))
+
+* ci(docs): merge benchmark chart into Pages deploy; update referenced docs
+
+Resolves the Pages-source conflict surfaced by doc-drift on PR #973: this repo currently serves
+  `https://tinaudio.github.io/synth-setter/dev/bench/` from the `gh-pages` branch ("Deploy from a
+  branch" source), which is mutually exclusive with `actions/deploy-pages@v4`'s requirement that the
+  Pages source be "GitHub Actions". Flipping that setting to make Phase 2 work would unpublish the
+  live benchmark chart.
+
+Fix: the `docs` workflow becomes the single deployer for the whole repo. `gh-pages` is retained as
+  the benchmark-action's persistence layer (the action writes to it, the data accumulates as before,
+  history and alert behavior are unchanged) but is no longer served directly. The `docs` workflow
+  checks out `gh-pages` to `gh-pages-data/`, copies `gh-pages-data/dev/bench/` into
+  `site/dev/bench/`, and deploys the combined site via `actions/deploy-pages@v4`. A new
+  `workflow_run` trigger fires `docs` on `test-vst-slow` completion so bench-only pushes still
+  redeploy. The chart URL is unchanged.
+
+Doc drift folded in (caused by this PR's diff):
+
+- `docs/reference/github-actions.md`: drop the stale 'no workflow uses an environment: block' claim;
+  add a 'Docs' subsection to the workflow catalog covering the new deploy job + bench merge; add the
+  `docs` <- `VST Slow Tests` workflow_run dependency to the dependency map. -
+  `docs/reference/audio-similarity-benchmarks.md`: rewrite the bootstrap section to set Pages source
+  to 'GitHub Actions' (not 'Deploy from a branch'); update the workflow-wiring diagram to show the
+  workflow_run redeploy path; clarify that `gh-pages` is now a data store, not a served branch. -
+  `docs/doc-map.yaml`: add a new mapping entry for `docs/reference/github-actions.md` so future
+  drift on workflow files (including `docs.yml` and `test-vst-slow.yml`) surfaces against the
+  workflow catalog.
+
+Closes #967 Refs #966
+
+* ci(docs): address Copilot review on PR #980
+
+Three inline review comments from Copilot:
+
+- docs.yml: replace `continue-on-error: true` on the gh-pages checkout with an explicit
+  branch-existence probe. The previous soft-fail swallowed transient network/auth failures (not just
+  a missing branch) and would have silently deployed without the chart. The new `Probe gh-pages
+  branch existence` step uses `gh api branches/gh-pages` to set a step output; both the checkout and
+  the merge step gate on it. Missing branch still soft-skips cleanly (fresh repo); transient
+  checkout failures now fail the workflow loudly.
+
+- docs.yml: harden the bench-merge cp against the `cp -R src dst` nested-directory hazard. If
+  `site/dev/bench` exists when cp runs (mkdocs emits there in the future, or this step is re-run
+  with leftover state), cp would create `site/dev/bench/bench/`. Now `rm -rf site/dev/bench` before
+  mkdir+cp guarantees the final path is always exactly `site/dev/bench/`.
+
+- github-actions.md: fix the workflow-name inconsistency I introduced. The catalog row gotcha
+  referenced `test-vst-slow` (file basename) while the dependency map referenced `VST Slow Tests`
+  (display name). Standardize on the display name in both places — display name is what
+  `workflow_run.workflows:` actually matches.
+
+Refs #967
+
+* ci(docs): make gh-pages probe distinguish 404 from transient errors
+
+Copilot follow-up on PR #980 (comment 3228539789): the previous probe ran `gh api ... >/dev/null
+  2>&1` and treated *any* non-zero exit as "branch missing", reproducing the over-broad soft-fail
+  the previous commit was meant to fix — a network blip, rate-limit, or auth glitch would silently
+  deploy without the chart.
+
+Use curl with explicit status-code discrimination instead:
+
+- HTTP 200 -> exists=true (happy path) - HTTP 404 -> exists=false (fresh repo, soft-skip intended) -
+  anything else (5xx, network failure, auth) -> exit 1 (fail loud)
+
+`--retry 3 --retry-delay 2` absorbs genuine transient blips; sustained failures still surface. `set
+  -euo pipefail` ensures curl-level errors (connection refused, DNS) also fail the step rather than
+  silently producing an empty http_code.
+
+- **workflows**: Add OCI custom image bake + PR-time test gate
+  ([#927](https://github.com/tinaudio/synth-setter/pull/927),
+  [`24da432`](https://github.com/tinaudio/synth-setter/commit/24da43250ea98aa7669b66cf697c9269cd198664))
+
+* ci(workflows): add OCI custom image bake workflow
+
+workflow_dispatch-only job that provisions a one-shot SkyPilot OCI cluster against a chosen task
+  template, lets its setup: block bake docker + the worker image into the boot volume, then calls
+  `oci compute image create` on the underlying instance (resolved via the same `ray-cluster-name`
+  freeform-tag query SkyPilot uses internally). The resulting image OCID is emitted to the job
+  summary and uploaded as an artifact. The cluster is torn down on success or failure.
+
+Refs #921
+
+* fix(workflows): bump oci-image-bake timeout to 120m
+
+Worst-case wall clock with default input timeouts is launch (20m) + SOFTSTOP wait (20m) +
+  image_create (30m) + checkout/install/teardown overhead (~8m) ≈ 78m. The previous
+  `timeout-minutes: 60` would have killed slow dispatches mid-image-create — the most expensive
+  step.
+
+* internal-fix(ci): address Copilot review comments on oci-image-bake
+
+Workflow has not yet merged; these are fixes to unreleased CI infra.
+
+- Pin oci-cli to 3.81.1 for reproducibility (Copilot 3221149248). Later steps parse `oci` JSON shape
+  (data.items[].identifier, data.id); an upstream CLI bump could shift those without warning.
+  SkyPilot is already pinned — match it.
+
+- Fail fast on FAILED_SETUP / FAILED_DRIVER / CANCELLED before imaging (Copilot 3221149268). The
+  bake exists to capture what the template setup: block produces; if setup did not complete, the
+  boot volume is
+
+not bake-ready and we should not snapshot it. Plain FAILED (task run: phase failure) is still
+  allowed since setup completed.
+
+- Improve single-node OCID resolution error (Copilot 3221149289). The workflow snapshots one boot
+  volume per bake, so resolution requires exactly one RUNNING instance under the cluster tag.
+  Multi-node templates now fail with an explicit "single-node bake" error naming the source
+  template, instead of a generic "expected 1, got N".
+
+- Drop unused OCI_COMPARTMENT_OCID from Resolve OCI instance OCID env (Copilot 3221149324). The
+  structured-search query is global within the tenancy and does not consume the compartment env var.
+
+- Clarify R2_ACCOUNT_ID secret docstring (Copilot 3221149208). It is required by
+  scripts/skypilot_write_provider_creds.sh, not by the template's envs: block — update the header
+  comment so the secrets list reflects the real requirement.
+
+Comment 3221149149 (timeout-minutes too low) was already addressed in 9b82dc9 (60m -> 120m). Replied
+  inline noting the prior fix.
+
+* ci(workflows): add test-oci-image-bake gate alongside the bake workflow
+
+PR-triggered gate that dispatches oci-image-bake.yaml on the PR branch with a PR-scoped
+  image_display_name (synth-setter-pr<PR#>-<sha>), waits for the bake to finish, then verifies the
+  produced OCI custom image is registered in the target compartment via `oci compute image list`.
+  Cleanup re-resolves the OCID under always() so a leaked image is reaped even when the in-step
+  lookup itself fails.
+
+Trigger-bake also cancels the dispatched bake run on its own cancel/ failure so an orphan bake
+  doesn't keep burning OCI VM time after the gate is gone, and detects branch-ref races by reading
+  the dispatched run's headSha and failing-fast if it doesn't match the gate's
+  pull_request.head.sha.
+
+Folds in what was originally PR #971; consolidating onto this PR so the bake workflow and its
+  PR-time test land together rather than shipping a gate whose target doesn't exist yet.
+
+* fix(workflows): set GH_REPO env so gh CLI works without a checkout
+
+The trigger-bake job dispatches the bake workflow via `gh workflow run` and polls via `gh run list`
+  — neither requires a code checkout, so the job has no actions/checkout step. Without a git
+  directory, the gh CLI can't auto-detect owner/repo from a remote, and every gh invocation exits
+  with:
+
+failed to determine base repo: failed to run git: fatal: not a git repository (or any of the parent
+  directories): .git
+
+Fix: set GH_REPO at the job level. The CLI honors that env var as a repo override, so gh dispatches
+  and queries work without a checkout.
+
+* fix(workflows): scope actions:write to trigger-bake; query bake runs by name
+
+Two fixes for the trigger-bake failure on dd16dde:
+
+- `gh run list --workflow oci-image-bake.yaml` 404s because gh resolves workflow filenames via the
+  repo's default branch, and the bake workflow only exists on this PR branch. Replaced with `gh run
+  list --branch ... --event workflow_dispatch` plus a jq filter on the workflow's `name:` field.
+  Same reason `gh workflow run` is replaced with a direct `gh api /dispatches` call. - Scoped
+  `actions: write` from the workflow level to the trigger-bake job only. verify-image-exists holds
+  OCI secrets and shouldn't also carry Actions Write. Addresses Copilot review (#3229344559,
+  #3229751021).
+
+Plus mdformat re-padded the catalog table to accommodate the test-oci-image-bake row's longer Gotcha
+  column (CI's pre-commit caught it where local hooks missed the cached state).
+
+* refactor(workflows): switch test-oci-image-bake to workflow_call
+
+GitHub's workflow_dispatch API resolves workflow filenames against the repo's default branch. For a
+  new workflow being added in the same PR that adds the test gate, the bake workflow isn't on the
+  default branch yet, so `gh workflow run` / `gh api /dispatches` 404 — verified on 77030e1's CI
+  run.
+
+Switching to workflow_call: `uses: ./.github/workflows/oci-image-bake.yaml` is resolved on the PR
+  branch's commit, so it works for the new-workflow-in-PR scenario. Same pattern as
+  test-spec-materialization.yml.
+
+Bake workflow changes: - Added `workflow_call` trigger mirroring `workflow_dispatch` inputs. -
+  Declared workflow-level outputs (image_ocid, image_display_name) wired to the bake job's step
+  outputs.
+
+Test gate changes: - Replaced trigger-bake (gh-CLI dispatch + poll + SHA-pin + orphan-cancel) with a
+  single `uses:` call. - Verify-and-cleanup reads `needs.bake.outputs.image_ocid`, asserts non-empty
+  on success, deletes by OCID under `always()`. - Dropped GH_REPO / actions:write — neither is
+  needed anymore.
+
+* fix(workflows): pass StatusRefreshMode.NONE to sky.status (was boolean)
+
+SkyPilot 0.12.0's `sky.status` now accepts a `StatusRefreshMode` enum for `refresh`, not a boolean.
+  Calling with `refresh=False` raised a pydantic ValidationError on the dev/dd16dde gate run:
+
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StatusBody / refresh / Input
+  should be 'NONE', 'AUTO' or 'FORCE' [type=enum, input_value=False, input_type=bool]
+
+That exception fired *after* the bake's status-poll completed with final=FAILED — the bake's "FAILED
+  is OK (setup completed)" branch is correct, but the very next line
+  (`sky.status(...refresh=False)`) crashed, which is what caused the gate run to exit 1 despite the
+  "allow run-phase FAILED" logic. Same fix unblocks both reported symptoms in the earlier failure.
+
+### Documentation
+
+- **reference**: Add Benchmarks nav entry linking to dev/bench Pages
+  ([#988](https://github.com/tinaudio/synth-setter/pull/988),
+  [`437c706`](https://github.com/tinaudio/synth-setter/commit/437c7066be89ac38795432bb6308c3574f072f21))
+
+The benchmark chart at https://tinaudio.github.io/synth-setter/dev/bench/ is deployed by Phase 2's
+  bench-merge step but had no link from the MkDocs site nav, so readers landing on the home page
+  couldn't discover it. Adding a single external-URL nav entry surfaces it in the top bar; Material
+  for MkDocs renders external entries with an external-link icon so the destination is clear.
+
+mkdocs build --strict stays clean; rendered home page contains the expected anchor pointing at the
+  bench URL.
+
+Closes #987
+
+### Features
+
+- **pipeline**: Switch skypilot launcher to sky.jobs managed-jobs SDK
+  ([`90ee8e4`](https://github.com/tinaudio/synth-setter/commit/90ee8e402a49b47ef39f9a87d4ad122fc979026b))
+
+Migrates the launcher (`src/pipeline/skypilot_launch.py`) from cluster-level launches (`sky.launch`
+  / `sky.down` / `sky.tail_logs`) to the managed-jobs SDK (`sky.jobs.launch` / `sky.jobs.cancel` /
+  `sky.jobs.tail_logs`) so the SkyPilot controller owns provisioning, retries, and terminal-status
+  compute release.
+
+Behavioral surface: * `sky.jobs.launch` returns `(job_ids, handle)`; the launcher extracts
+  `job_ids[0]` and treats an empty list as a half-submitted job (cancelled in `finally`). * CLI flag
+  `--cluster-name` renamed to `--job-name` (the SkyPilot managed-jobs identifier). `--cluster-name`
+  kept as a deprecation alias — emits a stderr warning when used. * New `_JOB_NAME_RE` validates
+  `--job-name` (and the derived fallback `synth-setter-smoke-<spec.task_name[:8]>`) before any IO:
+  the value is interpolated into a local tempfile path and an R2 object key, so path-separator-free
+  and ≤63 chars (k8s-label subset). * Detached-mode operator hints now point at `sky jobs logs
+  --name` / `sky jobs cancel --name` (managed-jobs CLI), not cluster CLI. * `_cancel_job` replaces
+  cluster teardown; tail-mode runs `sky.jobs.tail_logs(follow=True)` and cancels every job in
+  `finally`.
+
+BREAKING CHANGE: `--cluster-name` is deprecated; pass `--job-name`. Workflow callers and dispatch
+  tooling that invoke the launcher programmatically should update the flag. The alias keeps existing
+  callers working, but emits a stderr warning each time it's used.
+
+Tests: tests/pipeline/test_entrypoints/test_skypilot_launch.py gets TestJobNameValidation +
+  TestJobNameAlias families, fan-out variants of `tail_logs` failure paths, none-tuple
+  parametrization, OCI argv-leak multi-secret loop, malformed-config provider parametrization,
+  env-var receipt assertion, rank → job_id ordering test, and a property-style cpus assertion. Total
+  592 pass under `make test-fast`.
+
+Workflow + docs caught up: * `.github/workflows/generate-dataset-shards.yaml` — launcher invoked
+  with `--job-name "$CLUSTER_NAME"`. Workflow inputs keep the `cluster_name` name for backward
+  compat (forwarded as `--job-name`). * `configs/compute/local-template.yaml` — header now
+  references `<job>.json` spec key. * `docs/design/skypilot-compute-integration.md` §4.1.1 — fully
+  migrated to `sky.jobs.launch` / `sky.jobs.tail_logs` / `sky.jobs.cancel` + `sky jobs logs --name`
+  / `sky jobs cancel --name`. * `docs/reference/configuration-reference.md` — `<cluster>.json` →
+  `<job>.json`. * `docs/architecture.md`, `docs/getting-started.md`,
+  `docs/design/data-pipeline-implementation-plan.md`, `docs/reference/github-actions.md`,
+  `docs/doc-map.yaml` — cluster→job rename drift cleanup.
+
+Fixes #875 Refs #904
+
+### Internal-Feat
+
+- **packaging**: Phase 1 — scaffold src/synth_setter package + setuptools src-layout config
+  ([#977](https://github.com/tinaudio/synth-setter/pull/977),
+  [`6a4c37b`](https://github.com/tinaudio/synth-setter/commit/6a4c37ba5972107980cdbf07890ead71bc07c749))
+
+* internal-feat(packaging): scaffold src/synth_setter package + setuptools src-layout config
+
+Phase 1 of the PEP src-layout migration (Refs #784, Closes #974).
+
+Adds the `src/synth_setter/` package skeleton and wires setuptools.packages.find + package-dir so
+  `pip install -e .` makes `import synth_setter` resolve. No file moves; every existing `from src.X`
+  import path keeps working. Adds `pythonpath = ["src"]` to pytest so the import resolves without an
+  install step too.
+
+This phase lands standalone to de-risk packaging changes before any of the ~52 import sites get
+  touched in Phases 2–5.
+
+* docs: note src/synth_setter scaffold in CLAUDE.md and architecture tree
+
+Adds a one-line bullet for the new src/synth_setter/ package in CLAUDE.md's Architecture section and
+  a matching row in docs/architecture.md's directory tree, so the package is documented alongside
+  its introduction. Companion to the Phase 1 scaffold added in 154aea2.
+
+Refs #784, Refs #974.
+
+### Refactoring
+
+- **ci**: Add scripts/capture-skypilot-state.sh + wire diagnostic capture into skypilot-local row
+  ([`af2a3fc`](https://github.com/tinaudio/synth-setter/commit/af2a3fc94549a8ed54b281f28f49a3608aa05d32))
+
+Adds a best-effort kube-apiserver + on-pod sky_logs snapshot the skypilot-local CI row can run
+  before `sky local down` reaps the kind cluster. Captures pod describes, events, controller logs,
+  and the controller's on-pod provision.log so scheduling-side hangs are diagnosable post-mortem —
+  see #876.
+
+* `scripts/capture-skypilot-state.sh` — bash-3.2 portable (so the same script runs under macOS
+  `/bin/bash` 3.2), no-`set -e` best-effort contract with `|| true` on every kubectl/exec call, only
+  fails if RUN_METADATA_DIR is unset. * `tests/scripts/test_capture_skypilot_state.py` — 13 cases
+  covering base captures, worker pod fan-out, controller pod identification, the "No resources
+  found" stdout banner (older kubectl ships it on stdout, would otherwise leak "No" as a pod name),
+  filename safety for unsafe characters, and rc=0 under various kubectl behaviors. *
+  `.github/workflows/generate-dataset-shards.yaml` (skypilot-local row): pin third-party actions
+  (helm/kind-action, azure/setup-kubectl, astral-sh/setup-uv) to commit SHAs, add a 20-min
+  step-level timeout on the launcher invocation so a hang doesn't burn the full 60-min job timeout
+  before the `if: always()` log snapshot runs, invoke the new capture script before `sky local
+  down`, and snapshot `~/sky_logs/` and `~/.sky/api_server/clients/*/sky_logs/` into the
+  run-metadata dir so the existing upload step picks them up. * `docs/doc-map.yaml` — track the new
+  capture script under the SkyPilot compute integration design doc.
+
+Refs #875
+
+- **pipeline,ci**: Unify cred bootstrap; inline kind controller-resource shrink; right-size
+  local-template
+  ([`def3760`](https://github.com/tinaudio/synth-setter/commit/def3760248304530a491d8118553f1fb6902c6fc))
+
+The launcher's local (kubernetes / kind) provider needs no compute auth — `sky local up` brings the
+  kind cluster with no credentials at all, and R2 env vars are forwarded into the pod via
+  task.update_envs. This PR drops the `--provider local` arm of `skypilot_write_provider_creds.sh`
+  (it was a no-op since R2 is universal), drops the OCI compartment OCID (SkyPilot's OCI backend
+  defaults to the root compartment), and writes the kind-only managed-jobs controller-resource
+  shrink directly from the CI workflow rather than routing it through the cred bootstrap.
+
+Behavioral changes: * `scripts/skypilot_write_provider_creds.sh` — provider is now `runpod|oci`
+  only; no `--provider local` arm. OCI writer no longer emits `oci.default.compartment_ocid` to
+  `~/.sky/config.yaml`. * `tests/scripts/test_skypilot_write_provider_creds.py` — drops the
+  local-provider scenarios; adds gating tests that confirm `--provider local` is rejected with a
+  clear error. * `.github/workflows/generate-dataset-shards.yaml` — new "Shrink managed-jobs
+  controller resources for kind" step writes `jobs.controller.resources` (cpus: 1+, memory: 1+) to
+  `~/.sky/config.yaml` before launch. Removes `OCI_COMPARTMENT_OCID` from the required-secrets
+  header comment. * `configs/compute/local-template.yaml` — `cpus: 2+` → `cpus: 1+` and `disk_size:
+  20` dropped to fit GHA-kind's allocatable headroom (k8s backend rejects `disk_size` anyway). Adds
+  inline rationale comments.
+
+Docs alignment: * `docs/getting-started.md` — reframes the OCI `~/.sky/config.yaml` instruction as
+  optional (only needed for non-root compartments). * `docs/reference/github-actions.md` — drops the
+  count "six OCI_* secrets" so the prose doesn't drift when secrets are added/removed, narrows the
+  `R2_ACCOUNT_ID` "Required by every launcher" claim to runpod/oci (skypilot-local no longer
+  triggers the cred bootstrap), removes the OCI_COMPARTMENT_OCID secrets-table row. *
+  `docs/design/skypilot-compute-integration.md` — §4.1 now lists `local-template.yaml` as a third
+  real template. * `docs/doc-map.yaml` — track `configs/compute/local-template.yaml` under the
+  SkyPilot compute integration design doc.
+
+Refs #875
+
+### Breaking Changes
+
+- **pipeline**: `--cluster-name` is deprecated; pass `--job-name`. Workflow callers and dispatch
+  tooling that invoke the launcher programmatically should update the flag. The alias keeps existing
+  callers working, but emits a stderr warning each time it's used.
+
+
 ## v1.1.0 (2026-05-12)
 
 ### Continuous Integration
