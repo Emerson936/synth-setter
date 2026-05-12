@@ -1,6 +1,294 @@
 # CHANGELOG
 
 
+## v1.1.0 (2026-05-12)
+
+### Continuous Integration
+
+- **ci-automation**: Local CI failure triage agent (claude -p, no CI invocation)
+  ([#924](https://github.com/tinaudio/synth-setter/pull/924),
+  [`ba1c57e`](https://github.com/tinaudio/synth-setter/commit/ba1c57e609e0d2f5e7457776e30cbf4dd18636c4))
+
+* ci(ci-automation): add autonomous CI triage agent (claude -p headless)
+
+Adds .github/workflows/ci-triage.yaml that fires on `workflow_run` completion for the project's CI
+  workflows. When the conclusion is `failure` and the run was not on a fork, the job installs
+  `nektos/act` + the Claude Code CLI and invokes `claude -p` with the prompt at
+  .github/triage/triage-prompt.md.
+
+The agent fetches failing logs via `gh run view --log-failed`, classifies the failure (flake /
+  resource_starvation / auth / real_bug), optionally reproduces locally with `act`, and routes to
+  one of:
+
+- Path A: open a draft PR with telemetry additions (PR #876 pattern). - Path B: file a
+  taxonomy-compliant tracking issue (default route). - Path C: re-run a single flake.
+
+Guardrails baked into the workflow and the prompt:
+
+- No-op unless CLAUDE_CODE_OAUTH_TOKEN secret is set. - Skips runs on forks (write perms must not
+  run against untrusted code). - Cooldown: one triage per failing run ID via `ci-triage/run-<id>`
+  branch. - Agent works in a `git worktree` off `ci-triage/*`, never pushes main / release/* / dev.
+  - Any PR is `--draft` — human approves the merge. - 30-minute job timeout; 30-turn agent budget.
+
+.github/triage/README.md covers one-time setup (`claude setup-token` + `gh secret set`), approving
+  fix PRs, manual re-trigger, and disabling.
+
+Refs #923
+
+* docs(ci-automation): fix triage agent drift caught by doc-drift on #924
+
+- Image registry: ghcr.io/tinaudio/synth-setter-dev → tinaudio/synth-setter (the dev-snapshot image
+  is published to DockerHub, not ghcr.io; act would have failed to pull). Confirmed against
+  push-to-ocir.yml and configs/compute/runpod-template.yaml.
+
+- Phase-parenting rule: prompt previously said new tracking issues should be sub-issues of Epic #148
+  directly. docs/design/github-taxonomy.md §3 requires Task/Bug/Feature MUST be sub-issues of a
+  Phase. Updated Path B to instruct the agent to find the active ci-automation Phase and parent
+  there.
+
+- Worktree creation: `git worktree add ../triage-work <triage_branch>` fails because the branch
+  doesn't pre-exist. Added `-b "${TRIAGE_BRANCH}"` to match the working example later in the prompt.
+
+- Skill path: dropped the stale local `.claude/skills/github-taxonomy/` reference (skill lives in
+  the tinaudio-synth-setter-skills plugin).
+
+- Turn budget: prompt said ~25 turns, workflow flag is --max-turns 30. Rewrote to reference the
+  workflow flag instead of restating the number.
+
+- README: replaced the inline (mixed display-name / filename-fragment) watched-workflow enumeration
+  with a pointer to the workflow's on.workflow_run.workflows list. Replaced "30-turn session" with
+  reference to --max-turns.
+
+- docs/doc-map.yaml: added structural mapping for .github/triage/README.md ←
+  .github/workflows/ci-triage.yaml + .github/triage/triage-prompt.md so future code changes there
+  are caught by doc-drift.
+
+* ci(ci-automation): address Copilot review on #924 (6 fixes)
+
+Pinned + verified the act and Claude Code CLI installs, provisioned the pre-commit toolchain Path A
+  needs for `make format`, and tightened the header and prompt comments flagged by Copilot.
+
+- workflow header now enumerates required secrets (CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN) to match
+  the `check-auth.yml` convention. - act install now pulls a pinned release tarball (v0.2.88) and
+  verifies it against the upstream `checksums.txt` SHA-256, replacing the `curl | sudo bash` of
+  `master/install.sh` flagged as a supply-chain risk. - `@anthropic-ai/claude-code` is pinned to
+  2.1.105 (matches the documented devcontainer baseline) so triage runs are reproducible across
+  days. - Cooldown comment now describes what the branch-existence check actually guards against
+  (manual re-dispatch / re-run from the UI) — `workflow_run` fires once per workflow run, not per
+  matrix job. - New `actions/setup-python@v6` + `pip install pre-commit` steps so Path A's `make
+  format` has the toolchain on PATH; previously relied on undefined runner state. - Triage prompt no
+  longer references the `github-taxonomy` plugin skill (unavailable in headless CI). Points
+  exclusively at the in-repo `docs/design/github-taxonomy.md` and §3/§4 references the agent can
+  actually read.
+
+* ci(ci-automation): pivot triage agent to local-only invocation
+
+Claude Code agents are local-only — CLAUDE_CODE_OAUTH_TOKEN-based headless CI invocation is
+  deprecated. The original design (workflow_run trigger → install claude CLI in GHA → run `claude
+  -p`) cannot work and is removed.
+
+Replaces the GHA workflow with a local helper:
+
+- Deleted .github/workflows/ci-triage.yaml. No CI side. - Added scripts/triage-ci.sh —
+  developer-side wrapper that takes a failing run ID, writes /tmp/triage/context.json, and pipes the
+  prompt template into local `claude -p` (--add-dir scoped to repo + context dir). - Rewrote
+  .github/triage/triage-prompt.md to describe a local context (developer's machine, gh CLI with full
+  creds, `act` optional). Hard rules unchanged: no main/release/dev pushes, draft PRs only, worktree
+  isolation, no --no-verify. - Rewrote .github/triage/README.md as a local operator guide:
+  prerequisites (claude CLI + gh + act), `./scripts/triage-ci.sh <run-id>` usage, manual invocation
+  path, fix-PR review flow. - Updated docs/doc-map.yaml: README now points at scripts/triage-ci.sh +
+  triage-prompt.md (workflow source removed from the mapping).
+
+Confirmed via parallel audit: no other Claude-in-CI workflows existed in the repo, so no separate
+  cleanup PR is needed. The Dockerfile / devcontainer references to the `claude` CLI are intentional
+  local-dev tooling and remain.
+
+* ci(ci-automation): address Copilot Round 2 review on #924
+
+scripts/triage-ci.sh: - Add `git` to the required-command check and run the check before any `$(git
+  ...)` expansion, so a missing `git` produces the explicit setup-pointer error instead of an opaque
+  shell failure. - Drop the `TRIAGE_DIR` env override. The agent reads `/tmp/triage/...` directly
+  per the prompt template; an override would silently desync the launcher from the agent.
+
+.github/triage/triage-prompt.md: - Replace the stdin-pipe invocation example with the positional-arg
+  form actually used by the wrapper and README (`claude -p "$(cat ...)"`). - Add an explicit
+  substitution-variable preamble at the top of Path A (`RUN_ID`, `REPO`, `RUN_URL`, `TRIAGE_BRANCH`,
+  `BUCKET`) sourced from `/tmp/triage/context.json`, and a `TRACKING_ISSUE` capture step between
+  filing the Path-B issue and opening the draft PR. The agent following the playbook verbatim now
+  has every variable defined before it is interpolated.
+
+.github/triage/README.md: - Replace the `curl .../master/install.sh | sudo bash` act install with a
+  pinned release tarball (`ACT_VERSION=v0.2.88`) verified against the upstream `checksums.txt`,
+  mirroring the supply-chain approach used by the prior workflow before the local-only pivot.
+
+### Documentation
+
+- Convert remaining Google-style docstring sections to Sphinx
+  ([#952](https://github.com/tinaudio/synth-setter/pull/952),
+  [`6a4427d`](https://github.com/tinaudio/synth-setter/commit/6a4427d4aad89ad22a2a68b010defd7fb68f1c94))
+
+* docs: convert remaining Google-style docstring sections to Sphinx
+
+The repo's configured docstring style is Sphinx (`[tool.docformatter]` and `[tool.pydoclint]` both
+  set to sphinx) and the bulk of the codebase already uses `:param:` / `:return:` / `:raises:`. A
+  handful of files in `src/` and `pipeline/` still had Google-style `Args:` / `Returns:` / `Raises:`
+  / `Example:` section headers, showing up as DOC003 violations in pydoclint's audit (#938).
+
+This converts them in place, matching the rest of the codebase: - `Args:` blocks → one `:param
+  <name>: ...` line per arg - `Returns:` blocks → `:return: ...` (dominant form, 7 vs 2 over
+  `:returns:`) - `Raises:` blocks → one `:raises <Exc>: ...` line per exception - `Example:` block
+  in `src/utils/utils.py` → `.. code-block:: python` directive
+
+No behavior changes; only docstring text. `scripts/` and `tests/` are out of scope per #938's
+  chunked remediation plan.
+
+Refs #938.
+
+* docs(wandb-integration): shift line refs after src/utils/utils.py docstring conversion
+
+The Google-→-Sphinx conversion in src/utils/utils.py shrank the task_wrapper docstring by one line,
+  shifting code below it up by one. Two line-range refs in wandb-integration.md were now off by one:
+
+- task_wrapper wandb.finish() finally block: 102-107 → 101-106 - watch_gradients source range:
+  138-149 → 137-148
+
+Caught by the doc-drift advisory on PR #952. Refs #938.
+
+* docs(skypilot-launch): clarify _run_workers :return: is a list
+
+The Sphinx-style :return: introduced in the prior commit kept the original Google-style wording,
+  which read like a scalar even though the function returns list[int]. Spelled out that it's a list
+  with one entry per rank, in cluster_names order, and called out the ``-1`` sentinel and tail-mode
+  behavior referenced elsewhere in the docstring.
+
+### Features
+
+- **training**: Job queue CLI for line-separated command sweeps
+  ([#929](https://github.com/tinaudio/synth-setter/pull/929),
+  [`aae002d`](https://github.com/tinaudio/synth-setter/commit/aae002d63c701333b7364081019b418a672f1fb4))
+
+* feat(training): queue commands via pueue with line-separated CLI
+
+Adds a thin pueue (https://github.com/Nukesor/pueue) wrapper for queueing training/sweep commands
+  from a single text file. Each non-blank, non-comment line of the file becomes one `pueue add` task
+  in a configurable group, with optional parallelism, working directory, and label prefix.
+
+- docker/ubuntu22_04/Dockerfile: install pueue + pueued static musl binaries (v4.0.4) for amd64 and
+  arm64 in builder-install-synth-setter-deps so the binaries land in dev-base and devcontainer-tools
+  alike. - scripts/pueue_queue.py: click CLI with --group, --parallel, --working-dir,
+  --label-prefix, --start-daemon, --dry-run. Public typed helpers (parse_command_file,
+  build_pueue_add_args, ensure_group, enqueue_all) are injected with a subprocess runner so tests
+  don't spawn a real pueue. - tests/scripts/test_pueue_queue.py: 20 tests pinning the public API and
+  click entry behavior with a FakeRunner. - .github/workflows/pueue-queue.yaml: workflow_dispatch
+  entry that runs the CLI inside the dev-snapshot image with the repo mounted, with optional dry-run
+  mode and a `pueue wait` step bounded by a timeout.
+
+Refs #928
+
+* address Copilot review feedback on #929
+
+scripts/pueue_queue.py: - parse_command_file: rewrite docstring to match implementation; the
+  function strips both leading AND trailing whitespace (the old prose said leading whitespace was
+  "preserved", which contradicted the code). Add an explicit test pinning the strip-leading behavior
+  for indented commands inside grouped sections (comment #3221306120).
+
+tests/scripts/test_pueue_queue.py: - Add two FakeRunner tests for ensure_daemon_running: no-op when
+  `pueue status` exits 0; runs `pueued -d` when it fails (#3221306239).
+
+docker/ubuntu22_04/Dockerfile: - Verify pueue/pueued downloads against pinned per-arch SHA256
+  checksums before chmod. Build now fails closed if upstream replaces the asset or the wget transfer
+  is corrupted (#3221306180).
+
+.github/workflows/pueue-queue.yaml: - Rewrite the header comment so it reflects that `pueue wait` is
+  opt-in via wait_timeout_seconds (default 0 returns immediately after enqueue), not unconditional
+  (#3221306275). - Mount the persisted pueue state via XDG_DATA_HOME=/pueue-state instead of the
+  root-only /root/.local/share/pueue path, so the artifact upload still captures state if image_tag
+  points at a non-root variant like devcontainer-tools (#3221306210).
+
+* refactor(job-queue): rename pueue-queue → job-queue; add PR validate workflow
+
+The user-facing CLI/workflow are now backend-neutral — pueue is treated as an implementation detail
+  that may be swapped later. The Python module, test module, and dispatchable workflow all use the
+  `job_queue` / `job-queue` name. References to pueue inside the code are kept where they describe
+  the current backend's behavior (e.g. `pueue add`, `pueue wait`, the Dockerfile install).
+
+- scripts/pueue_queue.py → scripts/job_queue.py: rename + docstring + --help text now refer to
+  "jobs" and "the backend" instead of pueue directly. Function names that describe pueue argv
+  (build_pueue_add_args) stay as-is — they describe the exact action they perform. -
+  tests/scripts/test_pueue_queue.py → tests/scripts/test_job_queue.py: import path + module
+  docstring updated. - .github/workflows/pueue-queue.yaml → .github/workflows/job-queue.yaml:
+  workflow name "Job Queue Dispatch"; env vars PUEUE_* → JOB_*; mount path /pueue-state →
+  /queue-state; artifact name queue-state-<run_id>. - docker/ubuntu22_04/Dockerfile: comment
+  reference updated to point at the new script path. The pueue install itself is unchanged.
+
+Adds .github/workflows/job-queue-validate.yaml — a PR-time validation workflow that runs on changes
+  to scripts/job_queue.py, tests/scripts/test_job_queue.py, or either job-queue workflow file. It
+  installs the same pinned pueue v4.0.4 musl binaries (sha256-verified) that the Dockerfile uses,
+  starts a daemon, and asserts:
+
+1. --dry-run prints one backend `add` per line and does not invoke the backend (3 add lines +
+  correct labels for a 3-line fixture). 2. An empty / comment-only file is rejected as a usage
+  error. 3. A real run enqueues 3 jobs into the requested group, all complete with status=Success,
+  labels match the prefix-N pattern. 4. Each task's captured stdout contains the expected echo
+  output.
+
+* fix(job-queue): inline pueue version + sha; rebase onto main
+
+- .github/workflows/job-queue-validate.yaml: drop the workflow-level `env:` block holding
+  PUEUE_VERSION / PUEUE_SHA256 / PUEUED_SHA256 and inline the literal values in the install step.
+  Three constants used in one place, in one file — no other step references them. - pyproject.toml:
+  add scripts/job_queue.py and tests/scripts/test_job_queue.py to the pydoclint exclude regex,
+  matching the precedent set by every other test in tests/scripts/. Tracked alongside #938 for
+  eventual sphinx-docstring cleanup.
+
+The branch is also rebased onto current main so the CI merge-commit run sees the post-relocation
+  `src/pipeline/` layout that landed in #965.
+
+* address Copilot post-rebase review feedback on #929
+
+scripts/job_queue.py: - ensure_daemon_running: after spawning `pueued -d`, re-probe `pueue status`
+  with bounded retries (DAEMON_READY_RETRIES x DAEMON_READY_SLEEP_SECONDS). Fixes the race where the
+  daemon has been forked but not yet bound its socket, causing the next `pueue group` to fail
+  intermittently. Raises RuntimeError with a clear message if the daemon never becomes reachable
+  inside the budget (#3222732938).
+
+tests/scripts/test_job_queue.py: - Add `_StatefulPueueStatusRunner` modeling the pre-/post-daemonize
+  race, plus two new tests pinning the retry-until-bound and budget-exhausted behaviors. Existing
+  daemon tests keep using the simpler FakeRunner.
+
+.github/workflows/job-queue.yaml: - Rewrite the header CAVEAT about `wait_timeout_seconds=0`. The
+  previous text said in-flight jobs "keep running inside the container", which is wrong: the worker
+  step uses `docker run --rm`, so when the in-container shell exits, any still-Running or Queued
+  tasks are killed by Docker. The new text spells this out and points readers at setting a non-zero
+  timeout when jobs need to actually complete (#3222732972).
+
+The third comment (#3222732979) flagged stale `pueue_queue` references in the PR description, but
+  the PR body was edited at the rename and no longer contains those names — replied inline.
+
+* address second Copilot round on #929 — dry-run boundary + docstrings
+
+scripts/job_queue.py: - main: use shlex.join(args) instead of " ".join(args) in --dry-run output.
+  The user's command (last positional after `--`) is a single argv element containing spaces; the
+  old form printed it as if it were many trailing args, so the dry-run line wasn't a faithful
+  copy-pasteable representation of what would actually be exec'd (#3222937280). - Add
+  :param/:returns/:rtype sphinx-style sections to every function so the file no longer needs a
+  pydoclint exclude. Implicit :raises directives removed where there was no explicit raise statement
+  (parse_command_file reraises through pathlib; pydoclint doesn't track that and the directive was
+  firing DOC502).
+
+tests/scripts/test_job_queue.py: - Same sphinx-style cleanup across all test functions, FakeRunner
+  methods, the _StatefulPueueStatusRunner methods, and the explode trip-wire. -
+  _StatefulPueueStatusRunner: rewrite the __call__ docstring so it no longer claims to "honor only
+  `check`" — the runner discards kwargs and that's fine because nothing it sees passes check=True in
+  a way that needs to raise (#3222937358). - Add
+  test_main_dry_run_quotes_command_arg_to_preserve_argv_boundaries pinning shlex.join behavior so a
+  future revert to " ".join can't silently regress the boundary.
+
+pyproject.toml: - Remove scripts/job_queue.py and tests/scripts/test_job_queue.py from the
+  [tool.pydoclint] exclude regex. Adding new files to a list whose docstring literally says "shrinks
+  as files are cleaned up" was a regression (#3222937320, #3222937341).
+
+
 ## v1.0.1 (2026-05-12)
 
 ### Bug Fixes
