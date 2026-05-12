@@ -1,6 +1,6 @@
 [project]
 name = "synth-setter"
-version = "1.0.0"
+version = "1.0.1"
 description = "Studying the effect of permutation symmetry on audio synthesiser parameter inference."
 authors = [{name = "Khaled Tinubu"}, {name = "tinaudio"}]
 readme = "README.md"
@@ -14,6 +14,7 @@ docs = [
   "mkdocstrings[python]",
   "griffe-pydantic",
 ]
+
 
 [tool.pytest.ini_options]
 addopts = [
