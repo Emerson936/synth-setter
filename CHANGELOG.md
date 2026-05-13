@@ -1,6 +1,246 @@
 # CHANGELOG
 
 
+## v4.0.0 (2026-05-13)
+
+### Chores
+
+- **pipeline**: Nest generate_dataset YAMLs + rename runpod-smoke-shard → smoke-shard
+  ([#997](https://github.com/tinaudio/synth-setter/pull/997),
+  [`b6f03cf`](https://github.com/tinaudio/synth-setter/commit/b6f03cf7d19b4c7d979688c414abd37a6e1dcd1e))
+
+* chore(pipeline): nest generate_dataset YAMLs under configs/experiment/generate_dataset/
+
+Move the four datagen experiment YAMLs (ci-materialize-test, 10-1k-shards, runpod-smoke-shard,
+  surge-simple-480k-10k) into a dedicated subdirectory so they group by the CLI module that consumes
+  them (synth_setter.cli.generate_dataset) and are visually separated from the training-side configs
+  that share configs/experiment/.
+
+Every Hydra `experiment=...` reference and `--experiment ...` CLI default in source, tests,
+  workflows, and docs is updated to the `generate_dataset/<stem>` form. `task_name` (and therefore
+  `dataset_config_id`, `r2_prefix`, W&B run IDs) remains the filename stem — only the Hydra
+  config-group path picks up the new prefix, so on-R2 paths and run IDs are unchanged.
+
+Refs #996
+
+* docs(pipeline): clarify Hydra experiment path vs filename stem
+
+Addresses Copilot review on #997 — the inline step-1 comment 'filename = experiment id' was true
+  pre-PR but conflates two identifiers post-nest. Reword to distinguish the filename stem (=
+  dataset_config_id / task_name) from the Hydra config-group path (`generate_dataset/<stem>`, the
+  value passed as `experiment=`).
+
+* chore(pipeline): rename runpod-smoke-shard → smoke-shard; pick up doc-drift strays
+
+The "runpod" qualifier in the CI smoke config name is a relic from when the smoke ran exclusively on
+  RunPod. It now runs on skypilot-local for every PR and is provider-agnostic, so the prefix
+  misleads more than it clarifies.
+
+Renames: - configs/experiment/generate_dataset/runpod-smoke-shard.yaml → smoke-shard.yaml -
+  task_name inside the YAML: runpod-smoke-shard → smoke-shard (the stem is the dataset_config_id, so
+  this changes the R2 path / W&B run-id prefix for new runs; pre-existing data under
+  data/runpod-smoke-shard/ is untouched). - DEFAULT_EXPERIMENT, workflow defaults, test fixture, doc
+  examples all follow.
+
+Also picks up four stale `configs/experiment/{id}.yaml` references the generate_dataset/ nesting
+  commit missed (flagged by the doc-drift agent): docs/architecture.md,
+  docs/reference/configuration-reference.md (×2), docs/design/storage-provenance-spec.md.
+
+* docs(pipeline): finish smoke-shard rename in data-pipeline.md examples
+
+Two occurrences of the old name were left behind when the working-tree edits didn't make it into the
+  previous rename commit: the §14.6 prose listing ("CI smoke and partitioner-exercise configs use
+  shorter, role-descriptive names") and the §14.7 directory tree.
+
+### Continuous Integration
+
+- Exclude matrix-named auto-approve check from pending count
+  ([#1000](https://github.com/tinaudio/synth-setter/pull/1000),
+  [`ff0dff0`](https://github.com/tinaudio/synth-setter/commit/ff0dff05d8435cc4dffb8d351d704d4f81d54970))
+
+The auto-approve matrix job (name: auto-approve (994), auto-approve (1000), ...) was treating its
+  own in_progress check entry as a blocking pending check, so every triggered run exited with
+  reason=1 check(s) still running before reaching the approve step.
+
+Update the jq filter in the conditions step to exclude any check name starting with 'auto-approve'
+  (matching every matrix variant) plus the existing 'Auto-approve status' summary check.
+
+Fixes #999
+
+### Refactoring
+
+- **layout**: Nest src/pipeline/ under synth_setter/, drop legacy src/ package
+  ([#1001](https://github.com/tinaudio/synth-setter/pull/1001),
+  [`7d8a438`](https://github.com/tinaudio/synth-setter/commit/7d8a43877a722e382e76787f28f36e987917c420))
+
+* refactor(layout)!: nest src/pipeline/ under synth_setter/, drop legacy src/ package
+
+Move `src/pipeline/` to `src/synth_setter/pipeline/` and remove the residual `src/__init__.py` so
+  `src/` now contains only the `synth_setter` package.
+
+Sweeps: - Python imports: `from src.pipeline.` -> `from synth_setter.pipeline.` across tests/,
+  scripts/, and the self-reference in materialize_spec.py's docstring. - YAML / Dockerfile / docs:
+  `python -m src.pipeline.` -> `python -m synth_setter.pipeline.` across .github/workflows,
+  configs/compute, configs/image, and docs/. - pyproject.toml [tool.setuptools].packages: drop
+  `src`, `src.pipeline`, `src.pipeline.ci`, `src.pipeline.schemas`; add `synth_setter.pipeline`,
+  `synth_setter.pipeline.ci`, `synth_setter.pipeline.schemas`. Delete the Phase 2 transition comment
+  that explained the dual registration. - CLAUDE.md Architecture section: collapse the separate
+  `src/pipeline/` bullet into a sub-bullet under `src/synth_setter/`. - tests/conftest.py: update
+  the `RenderConfig` reference comment.
+
+`MODEL_BASELINE` in tests/test_compare_baseline_configs.py is intentionally unchanged — the
+  project's stable-baseline-anchor rule applies and the resolved-YAML grep confirmed no `_target_:
+  src.pipeline` rewrites surface under the move.
+
+The `!` flags this as breaking because `import src.pipeline` now raises `ModuleNotFoundError`. All
+  in-tree callers have been migrated.
+
+Closes #995 Refs #784
+
+* fix(ci,docs): pip install -e . in docker-build-validation; address Copilot review
+
+Phase 3 (#995) rewrote `.github/workflows/docker-build-validation.yml` to invoke `python -m
+  synth_setter.pipeline.ci.load_image_config`, but the workflow's setup only installed `pyyaml
+  pydantic` — the `synth_setter` package itself was never installed on the runner. Pre-Phase-3 the
+  call worked because `python -m src.pipeline.ci.load_image_config` resolved against the
+  cwd-relative `src/` directory; post-Phase-3 the principled fix is `pip install -e .`, matching the
+  pattern Phase 2 (#991) established for every other CI workflow that spawns Python expecting
+  `synth_setter`.
+
+Also addresses three inline review findings from Copilot on PR #1001:
+
+- src/synth_setter/cli/generate_dataset.py: drop the `TODO(#784): collapse to
+  synth_setter.pipeline.* once Phase 3 hoists ...` comment; the imports below are already on
+  `synth_setter.pipeline.*` after this PR, so the TODO is satisfied. - docs/doc-map.yaml: correct
+  the `covers:` description for `src/synth_setter/pipeline/constants.py` — the module defines only
+  `INPUT_SPEC_FILENAME`, no R2 bucket name constant. -
+  docs/design/data-pipeline-implementation-plan.md: repoint the `make_dataset` import example from
+  the non-existent `synth_setter.pipeline.vst` to the actual current location,
+  `synth_setter.data.vst.generate_vst_dataset`.
+
+Refs #995 Refs #784
+
+* fix(ci): also install pyyaml + pydantic for docker-build-validation
+
+The previous fix (`pip install -e .`) makes `synth_setter` importable but doesn't pull in `pyyaml`
+  or `pydantic` because neither is a declared runtime dependency in `pyproject.toml`. The Phase 3
+  sweep replaced the prior bare `pyyaml pydantic` install with `pip install -e .` alone, which
+  re-broke the same step on a different `ModuleNotFoundError`. Pin both explicitly alongside the
+  editable install so the step has a self-contained environment for `python -m
+  synth_setter.pipeline.ci.load_image_config`.
+
+* fix(ci,docs): install synth_setter for validate-dataset-shards; fix duplicate stale vst import
+
+Two follow-up findings from Copilot's review of b9dd27d:
+
+1. .github/workflows/validate-dataset-shards.yaml — the validate-spec job runs `python3 -m
+  synth_setter.pipeline.ci.validate_spec` but its install step only installed pydantic. Same
+  regression as docker-build-validation.yml in b9dd27d. Use `pip install --no-deps -e .` alongside
+  the explicit `pydantic>=2,<3` pin so the runner-side env stays minimal (no torch) but synth_setter
+  is importable. The comment block above the step (which explains why this is a minimal install) is
+  preserved verbatim — the rationale still holds.
+
+2. docs/design/data-pipeline-implementation-plan.md L931 — the "Assumptions" section had a second
+  stale reference to the non-existent `synth_setter.pipeline.vst.make_dataset` module that c669164
+  only fixed at L562. Repointed to the actual current location,
+  `synth_setter.data.vst.generate_vst_dataset.make_dataset`, matching the L562 fix.
+
+* fix(ci): install synth_setter for spec-materialization host-side validate
+
+The host-side `Validate spec structure` step in spec-materialization.yml and the `Assert
+  test-specific values` step in test-spec-materialization.yml both run `python3 -m
+  synth_setter.pipeline.ci.validate_spec` outside the docker container. Phase 3 made `synth_setter`
+  only importable when installed (PEP src-layout, sources under src/), so both invocations would
+  raise ModuleNotFoundError on a fresh runner.
+
+Same fix pattern as c669164 / b9dd27d9 / b0c9cfd: add setup-python + `pip install --no-deps -e .
+  "pydantic>=2,<3"` before the python invocation. --no-deps keeps the host env minimal (torch stays
+  in the image).
+
+Addresses Copilot's suppressed low-confidence comment from review 4282446908 on
+  .github/workflows/test-spec-materialization.yml:35.
+
+Refs #995
+
+* fix(ci): drop --no-deps from host-side validate_spec installs
+
+The `pip install --no-deps -e . "pydantic>=2,<3"` install pattern used by the three host-side
+  `Validate spec structure` / equivalent steps had a subtle bug: `--no-deps` applies to *every*
+  package in the pip command, not just the editable install. As a result pydantic gets installed but
+  its required `pydantic-core` (a separately-shipped C extension) does not. The act-verify CI job
+  caught this on PR #1001 with:
+
+Successfully installed pydantic-2.13.4 synth-setter-3.0.0 ... ModuleNotFoundError: No module named
+  'pydantic_core'
+
+`--no-deps` was originally added to keep the host env minimal (no torch). The minimal-install goal
+  is already met by `[project].dependencies = []` in pyproject.toml — the editable install adds
+  nothing transitively for synth_setter itself. Dropping `--no-deps` lets pydantic pull in its
+  required pydantic-core, while torch still stays out of the env.
+
+Affects three workflows (each running `python3 -m synth_setter.pipeline.ci.validate_spec` on a host
+  runner, not in the docker image):
+
+- .github/workflows/validate-dataset-shards.yaml - .github/workflows/spec-materialization.yml -
+  .github/workflows/test-spec-materialization.yml
+
+Comment blocks above each install step are updated to explain the non-obvious interaction between
+  `--no-deps` and pydantic's own dependency on pydantic-core, so the next refactor doesn't
+  reintroduce the flag.
+
+### Testing
+
+- **baseline-configs**: Strip _target_ at any depth instead of bumping MODEL_BASELINE
+  ([#994](https://github.com/tinaudio/synth-setter/pull/994),
+  [`5669db8`](https://github.com/tinaudio/synth-setter/commit/5669db8054f4a6b41d9d7d29ecb00fb5d514630b))
+
+* test(baseline-configs): strip _target_ at any depth instead of bumping MODEL_BASELINE
+
+PR #991's commit 303eee3 bumped MODEL_BASELINE from "v0.0.0" to the head of Phase 2 to absorb the
+  resolved-YAML diff from the `src.X` → `synth_setter.X` `_target_:` rewrite. That eroded the
+  baseline anchor's semantic: MODEL_BASELINE should be the stable "published-results known-good"
+  snapshot, not a moving target that bumps every layout refactor.
+
+Restore MODEL_BASELINE = "v0.0.0" and absorb the mechanical migration through a new
+  ACCEPTED_DIFF_LEAVES list (analogous to ACCEPTED_DIFFS but matching leaf-name keys at any nesting
+  depth). The supporting helper _strip_leaf_keys walks the resolved dict and removes any key whose
+  leaf name is in the list.
+
+Trade-off accepted: until #993 lands a mechanical-transform helper, any `_target_:` divergence —
+  including hypothetical unrelated drift — is stripped silently. The helper will replace the strip
+  and restore catch coverage by matching the transformed baseline `_target_` against the live tree.
+
+Verified: `pytest tests/test_compare_baseline_configs.py -v` passes (87 cases, KOSC + SURGE +
+  PREDICT + fixture). Same coverage as the previous bump-baseline approach.
+
+Closes #993 Refs #989
+
+* test(baseline-configs): add focused unit tests for _strip_leaf_keys
+
+Addresses Copilot review feedback on PR #994 (3234331342): the recursive strip helper is only
+  exercised indirectly by the slow baseline-comparison suite (~10 min). Add six focused unit tests
+  covering dict-nested, list-nested, mutation-safety (deep-copy contract), empty-leaves identity,
+  and multi-leaf stripping — so future edits to _strip_leaf_keys surface as a fast unit failure
+  rather than passing the integration suite silently.
+
+Verified: `pytest tests/test_compare_baseline_configs.py::TestStripLeafKeys -v` passes 6/6 in 0.32s.
+
+Refs #989 #993
+
+* docs: clarify MODEL_BASELINE pins predict-script tests too
+
+Addresses Copilot review comment 3234666869 on PR #994: my rewritten prose preserved the original
+  docstring's inaccurate scope claim that MODEL_BASELINE only pins jobs/train/{kosc,surge}/train.sh,
+  when it also pins the 18 jobs/predict/*.sh predict-script tests through
+  test_predict_configs_are_equal. Updated both the module docstring (line 18-22) and the inline
+  comment above MODEL_BASELINE (line 85-88) to name the predict-script tests too — so future
+  bump-policy decisions are made against an accurate map of what the anchor actually covers.
+
+No code paths changed; docstring/comment-only.
+
+Refs #993 #989
+
+
 ## v3.0.0 (2026-05-13)
 
 ### Refactoring
