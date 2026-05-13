@@ -1,6 +1,696 @@
 # CHANGELOG
 
 
+## v5.0.1 (2026-05-13)
+
+### Bug Fixes
+
+- **ci**: Skip Copilot dynamic-workflow check-runs in auto-approve
+  ([#1033](https://github.com/tinaudio/synth-setter/pull/1033),
+  [`9ed4462`](https://github.com/tinaudio/synth-setter/commit/9ed4462eccfc776aa74963d04c6edbb89895d714))
+
+Copilot's "Copilot code review" workflow runs as a GitHub-managed event=dynamic workflow that can
+  leave a failed "Prepare" bootstrap check-run ("Resource not accessible by integration") attached
+  to the head SHA even when the review itself posts successfully in a later run. The existing
+  dedupe-by-name doesn't help because the failed check_run name only appears in the failing run.
+
+Condition 2 now lists workflow_runs for the SHA, collects the check_suite_ids of any workflow_run
+  with name=="Copilot code review", and excludes check-runs in those suites. Scoped to the workflow
+  name rather than event=="dynamic" so the GitHub-managed default-setup CodeQL pipeline (workflow
+  name "PR #<n>") still gates the auto-approve.
+
+Replayed Condition 2 against PR #1024's head SHA: PENDING=0 FAILED=0, all 17 user-owned checks
+  preserved, Copilot's failed "Prepare" gone.
+
+Closes #1032
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+### Chores
+
+- **ci**: Fix broken mutmut sandbox imports + document setup
+  ([#1026](https://github.com/tinaudio/synth-setter/pull/1026),
+  [`b2cc2a1`](https://github.com/tinaudio/synth-setter/commit/b2cc2a1fa454f25d83707b539f5c2ba0949546ca))
+
+* chore(ci): fix broken mutmut sandbox imports + document setup
+
+mutmut copies only `paths_to_mutate` into `mutants/` and strips the real `src/` off `sys.path`, so
+  tests that transitively import un-mutated parts of the package (e.g.
+  `synth_setter.cli.generate_dataset`, `synth_setter.pipeline.r2_io`) blow up during stats
+  collection with ImportError. PR #302 worked because it mutated `scripts/` only; the Phase 4 widen
+  to `src/synth_setter/{evaluation,tools,pipeline/data}/` broke this path and was never re-verified
+  end-to-end.
+
+Add `also_copy = ["src/synth_setter/"]` so the whole package lands in the sandbox alongside the
+  mutated subdirs, and document the moving parts in CLAUDE.md (Commands + a Mutation Testing
+  section) so the next time someone widens `paths_to_mutate` they know to recheck this.
+
+Refs #296
+
+* chore(ci): make mutmut run end-to-end (Linux CI workflow + subprocess fix)
+
+Three changes on top of the import-resolution fix in this PR's first commit:
+
+1. **`tests/pipeline/data/test_stats.py`** — rewrite
+  `test_cli_help_advertises_mask_degenerate_bins_flag` to invoke `_parse_args(["--help"])`
+  in-process instead of shelling out via `python -m`. Under `mutmut run`'s stats phase, the
+  subprocess inherited `MUTANT_UNDER_TEST=stats` and the mutated module's trampoline tripped on
+  `mutmut.config is None` in the fresh interpreter, crashing stats collection. In-process avoids
+  that entirely and lets mutations of `_parse_args` actually be exercised by this test (the
+  subprocess form would have always run the un-mutated function).
+
+2. **`.github/workflows/mutmut.yaml`** — new workflow_dispatch + weekly cron job that runs `mutmut
+  run` end-to-end on ubuntu-latest and uploads the `mutants/` meta as an artifact. This is the
+  authoritative end-to-end gate for the `[tool.mutmut]` config. macOS local runs cannot serve as
+  that gate because `tests/conftest.py` imports torch/h5py/hydra into the parent and Apple's
+  fork-safety check then SIGSEGVs every forked child.
+
+3. **`Makefile` + `CLAUDE.md`** — `make mutmut` sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`
+  (defensive on macOS, no-op on Linux) and CLAUDE.md's "Mutation Testing" section now covers (a) the
+  subprocess pitfall, (b) the macOS caveat, and (c) where the authoritative run lives.
+
+* ci(mutmut): TEMP pull_request trigger to Level-1-verify the workflow on PR #1026 (revert before
+  merge)
+
+* ci(mutmut): drop the temporary pull_request trigger
+
+Run 25829272616 (this branch's first commit with the workflow added) completed green on
+  ubuntu-latest with the expected mix of statuses (🎉 810 killed, 🙁 341 survived, 🫥 1771 no tests, ⏰
+  3 timeouts), so the workflow is now Level-1-verified. Restore the trigger surface to
+  workflow_dispatch + weekly cron only.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **ci**: Tighten test-dataset-generation PR trigger paths
+  ([#1028](https://github.com/tinaudio/synth-setter/pull/1028),
+  [`25379db`](https://github.com/tinaudio/synth-setter/commit/25379dbf73d972c35be88bef80416f192f9a956c))
+
+* chore(ci): tighten test-dataset-generation PR trigger paths
+
+Drop `pyproject.toml`, narrow `configs/experiment/**` to the `generate_dataset/` subdir, and replace
+  the broad `src/synth_setter/pipeline/schemas/**` glob with the specific files actually consumed by
+  the generation path (spec.py, image_config.py, prefix.py). Document the rationale in a YAML-level
+  comment block above the `pull_request:` key so future trigger edits know the policy.
+
+Closes #1027
+
+* chore(ci): address copilot review on PR #1028
+
+Two changes from copilot's review:
+
+1. Drop `src/synth_setter/pipeline/schemas/image_config.py` from the trigger list. It is consumed
+  only by `pipeline/ci/load_image_config.py` for `docker-build-validation.yml`; nothing on the
+  `test-dataset-generation` invocation path imports it. Including it in this filter contradicted the
+  tightening goal.
+
+2. Expand the `pyproject.toml` rationale comment to acknowledge that the `skypilot-local` row's `uv
+  pip install --system -e .` step DOES depend on pyproject.toml, and explain why we still accept the
+  redundant coverage from `test.yml` and `docker-build-validation.yml` rather than re-firing on
+  every lint / dev-only pyproject change.
+
+Refs #1027
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **layout**: Finish Phase 5 of #784 — delete setup.py, switch to setuptools find, sweep layout docs
+  ([#1021](https://github.com/tinaudio/synth-setter/pull/1021),
+  [`3d4b4eb`](https://github.com/tinaudio/synth-setter/commit/3d4b4eb8428bc2edf879a793c5f122a28b33c0c9))
+
+After Phase 4 (#1009 / #1005) closed, the PEP src-layout migration is functionally complete —
+  `src/synth_setter/` is the only package on disk, `from src.` / `from pipeline.` no longer resolve,
+  and `scripts/` is depopulated. Phase 5 is the cleanup pass.
+
+Changes:
+
+- Delete top-level `setup.py` (legacy stub kept through Phase 4 for compatibility; Phase 2 already
+  moved `console_scripts` into `[project.scripts]`). - Replace the hand-maintained 14-entry
+  `[tool.setuptools] packages = [...]` list with `[tool.setuptools.packages.find] where = ["src"]`
+  plus `[tool.setuptools.package-dir] "" = "src"`. Verified against the egg-info SOURCES.txt
+  produced by `uv pip install -e .` in a fresh venv: the finder discovers exactly the same 14
+  `synth_setter.*` subpackages, and `entry_points.txt` exposes exactly the three canonical console
+  scripts. - Drop `"setup.py"` from `paths:` in `.github/workflows/test.yml` and
+  `.github/workflows/test-conda.yml` (file no longer exists). Drop redundant
+  `"src/synth_setter/pipeline/**"` entries — already covered by `"src/**"` after Phase 3. - Remove
+  dead shellcheck excludes for `scripts/aggregate_samples.sh` and `scripts/get-ckpt-from-wandb.sh`
+  (both deleted in Phase 4). - Refresh `docs/architecture.md` Directory Structure tree — still
+  showed the pre-Phase-2 layout (`src/train.py`, `src/data/`, top-level `pipeline/`). Now reflects
+  `src/synth_setter/{cli,data,models,utils, pipeline,evaluation,tools}/`. - Drop "Populated across
+  Phases 2-5" / "Phase 3, #995" forward-looking phrasing from `CLAUDE.md` and `README.md`. Add
+  `evaluation/` and `tools/` to the per-subpackage list (these were absent from the CLAUDE.md tree).
+  Note the `sync_worker_checkout.sh` bake-lag exception in CLAUDE.md.
+
+Out of scope:
+
+- `scripts/sync_worker_checkout.sh` stays at the bare root (SkyPilot bake-lag, see 5992aff).
+
+Closes #1020. Part of #784.
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **lint**: Close P1/P5/P6 pydoclint blind spots
+  ([#978](https://github.com/tinaudio/synth-setter/pull/978),
+  [`e2c780a`](https://github.com/tinaudio/synth-setter/commit/e2c780ae3677279f07c832d6f4b8f90faea54558))
+
+* chore(lint): close P1/P5/P6 pydoclint blind spots from adversarial probe
+
+Three concrete fixes for the slip categories the #939 adversarial probe documented. None of P2/P3/P4
+  are addressed here — those are inherent to pydoclint and remain Open Questions on #938.
+
+P5 — flip pydoclint native-mode-noqa-location to "definition". The CLI default is "docstring", so
+  suppressions on the def line were silently inert. Aligning with flake8/ruff convention means `#
+  noqa: DOCxxx` next to `def` now does what every developer in this stack expects.
+
+P1 — add ruff D102/D103/D107 (missing-docstring rules). Pydoclint defers "must have a docstring" to
+  pydocstyle, which was not wired in. Ruff implements the same family. D102 = public method, D103 =
+  public function, D107 = __init__. Per-file-ignores cover the 40 tracked files that fail today; the
+  list mirrors [tool.pydoclint].exclude.
+
+P6 — CI guard against new defs/classes in pydoclint-excluded files.
+  scripts/check_no_new_funcs_in_pydoclint_excluded.py reads the pydoclint exclude regex from
+  pyproject.toml and scans the PR diff for `+def`/ `+class` lines whose file matches it. New tests
+  pin its behaviour on synthetic diffs; wired into code-quality-pr.yaml as a new step.
+
+CONTRIBUTING.md and .github/agents/lint-cleanup.md updated to describe the new ruff D rules, the
+  def-line noqa convention, and the guard.
+
+Refs #938 Refs #939
+
+* docs(pydoclint): address doc-drift after P1/P5/P6 fixes
+
+- CONTRIBUTING.md: restore ANN001 to the ruff rule list it had been dropped from when D102/D103/D107
+  were added. - CLAUDE.md: replace the inlined ruff rule list with a pointer to
+  [tool.ruff.lint].select so the drift clock does not reset on the next rule addition; mention the
+  new D rules. - docs/reference/github-actions.md: code-quality-pr now also runs the
+  pydoclint-excluded-file ratchet; document the new responsibility and the fetch-depth: 0
+  requirement that goes with it.
+
+* chore(lint): address Copilot review on PR #978
+
+- Remove tests/scripts/test_check_no_new_funcs_in_pydoclint_excluded.py from
+  [tool.pydoclint].exclude and add `# noqa: DOC101,DOC103` to the four test defs that take pytest
+  fixtures. The previous setup made the PR self-fail its own new P6 guard (verified: guard exit=1
+  against origin/main, 12 findings before this commit; exit=0 after). (comment #3223490913)
+
+- Replace `scripts/**` and `src/data/**` directory globs in [tool.ruff.lint.per-file-ignores] with
+  per-file entries mirroring [tool.pydoclint].exclude. New files under those directories are no
+  longer silently exempt from D102/D103/D107. (comment #3223490899)
+
+- Skip `\\ No newline at end of file` diff metadata in the guard's line counter; add a pinning test.
+  Without this, post-marker line numbers in the guard's `path:line: name` report could be
+  off-by-one. (comment #3223490926)
+
+- Add an explicit `tomli; python_version < "3.11"` pin to requirements-app.txt. The dep was already
+  transitively available via pytest/runpod, but pinning explicitly removes the fragility of relying
+  on a third-party transitive resolution. (comment #3223490886)
+
+Refs #938
+
+* chore(lint): address Copilot post-push review on PR #978
+
+Three new Copilot comments after the merge from main:
+
+- pyproject.toml: flatten src/models/** for D102/D103/D107 the same way scripts/** and src/data/**
+  were already flattened. Keep ANN001 on the glob (legacy, separate concern) but list each model
+  file explicitly for the D-rules so new files under src/models/ are not silently exempt. (comment
+  #3228263848)
+
+- scripts/check_no_new_funcs_in_pydoclint_excluded.py: fix module docstring drift. The text said
+  nested closures with "six or more leading spaces" are ignored, but DEF_OR_CLASS_PATTERN matches
+  0-4 spaces, so anything >=5 is ignored. Rewrote to name the threshold precisely and point at the
+  regex where it lives. (comment #3228263810)
+
+- tests/scripts/test_check_no_new_funcs_in_pydoclint_excluded.py: import the guard via
+  importlib.util.spec_from_file_location instead of mutating sys.path at module import time. Avoids
+  leaking the change into the rest of the test session. (comment #3228263867)
+
+* chore: trigger copilot review
+
+Empty commit per CLAUDE.md step 6a — Copilot did not re-review 2625abd within the 15-min SLA and
+  reviewers API rejects copilot-pull-request-reviewer as a non-collaborator. Push restarts the
+  readiness loop.
+
+* docs(test): fix Copilot-flagged docstring typo on diff-header test
+
+Copilot review comment #3228504254 on PR #978: the test docstring said "`+-+` headers" — that is not
+  a real unified-diff marker. The test actually guards against `+++ b/file.py` and `--- a/file.py`
+  headers being mistaken for additions. Updated the docstring to name both markers correctly.
+
+* chore: resolve main merge conflicts in pydoclint follow-up PR
+
+Agent-Logs-Url:
+  https://github.com/tinaudio/synth-setter/sessions/21c6c7a6-a341-4ed4-8ec7-ab11adad08ee
+
+Co-authored-by: ktinubu <17952332+ktinubu@users.noreply.github.com>
+
+* chore(lint): close P6 ratchet gap exposed by Phase 4 merge
+
+The Phase 4 layout migration (#1009) moved files into src/synth_setter/{tools,models,metrics.py}/.
+  The ruff per-file-ignores were updated to mirror the new paths, but [tool.pydoclint].exclude
+  wasn't, so 13 files had D102/D103/D107 ignored but were not in the pydoclint exclude regex —
+  re-opening the same blind spot this PR's P6 ratchet was supposed to close.
+
+Restores the maintainer's stated invariant from review round 2 (comment #3228291103: "D-rule ignores
+  mirror pydoclint.exclude") by adding the missing entries:
+
+src/synth_setter/metrics.py src/synth_setter/tools/model_from_wandb.py
+  src/synth_setter/tools/paramspec_to_table.py src/synth_setter/tools/plot_param2tok.py
+  src/synth_setter/tools/sig_perf.py src/synth_setter/models/components/cnn.py
+  src/synth_setter/models/components/embed_pool.py
+  src/synth_setter/models/components/residual_mlp.py
+  src/synth_setter/models/components/vector_field.py src/synth_setter/models/ksin_ff_module.py
+  src/synth_setter/models/surge_ff_module.py src/synth_setter/models/surge_flow_matching_module.py
+  src/synth_setter/models/surge_flowvae_module.py
+
+After this change, an adversarial probe (synthetic +def in
+  src/synth_setter/{metrics,tools/sig_perf,models/components/cnn, models/ksin_ff_module}.py) makes
+  the guard exit 1 in every case; the 13 existing P6 tests still pass.
+
+---------
+
+Co-authored-by: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **skills**: Split repo-review-full into post and no-comments variants
+  ([#1018](https://github.com/tinaudio/synth-setter/pull/1018),
+  [`d6f7fdc`](https://github.com/tinaudio/synth-setter/commit/d6f7fdc0c6a6b4b60b1c2ed0d86be7b9584220f7))
+
+* chore(skills): split repo-review-full into post and no-comments variants
+
+Extract the analysis pipeline (PR resolution, PR-health inspection, skill selection, parallel
+  fan-out, finding aggregation, findings JSON) into
+  .claude/skills/_shared/repo-review-full-analysis.md so both delivery modes reuse identical logic.
+
+Two slash commands now wrap that pipeline:
+
+- /repo-review-full — runs the pipeline and posts every BLOCK/WARN as an unresolved inline review
+  comment via post_review.py (unchanged behavior). - /repo-review-full-no-comments — runs the same
+  pipeline but renders the aggregated findings inline in chat. Zero GitHub side effects. Useful for
+  dry-runs, pre-review iteration, or any time posting is undesirable.
+
+CLAUDE.md's "Code Review" section is updated to list all three review skills (/repo-review,
+  /repo-review-full, /repo-review-full-no-comments).
+
+* docs(claude-md): tighten /repo-review-full pointer to the shared analysis file
+
+doc-drift on #1018 flagged that 'Selection rules live in .claude/skills/repo-review-full/SKILL.md'
+  was stale after this PR's split — the fan-out selection table (Step 3) now lives in the shared
+  analysis file, and the per-skill SKILL.md is a thin shim around it.
+
+* docs(skills): fix selection-table wording in shared analysis file
+
+- Rename column header from "Skills that always run" to "Skills to run" — only two rows always run;
+  the rest are conditional. Copilot flagged the original header as misleading on #1018. - Update the
+  ML row's path from "src/ or pipeline/" to "src/synth_setter/" — there's no top-level pipeline/
+  directory; the data pipeline lives under src/synth_setter/pipeline/. Also flagged on #1018.
+
+Refs #1019
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+### Continuous Integration
+
+- **docker**: Strip runtime PYTHONPATH from docker runs in workflows
+  ([#1017](https://github.com/tinaudio/synth-setter/pull/1017),
+  [`ad5c853`](https://github.com/tinaudio/synth-setter/commit/ad5c853689e93005b8111b8ce96111725e2bb7ba))
+
+PR #647 / #667 fixed setup.py so find_packages exposes the pipeline package without a runtime
+  PYTHONPATH override, and PR #797 wired dev-snapshot to rebuild on every push-to-main (merged
+  2026-05-04) so the in-image package surface tracks main. The temporary -e
+  PYTHONPATH=/home/build/synth-setter override added in 3529fae is no longer needed; strip it from
+  all docker run invocations.
+
+Removes 15 -e PYTHONPATH=... lines across 10 workflow files:
+
+- .github/workflows/docker-build-validation.yml - .github/workflows/flush-investigation.yml -
+  .github/workflows/generate-dataset-shards.yaml - .github/workflows/job-queue.yaml -
+  .github/workflows/spec-materialization.yml - .github/workflows/test-dataset-generation.yml -
+  .github/workflows/test-gpu.yml - .github/workflows/test-skypilot-debug.yml -
+  .github/workflows/test-vst-slow.yml - .github/workflows/validate-dataset-shards.yaml
+
+The integration check is the smoke tests in docker-build-validation.yml and
+  test-dataset-generation.yml; a local docker probe was not run because docker was not available in
+  the working environment.
+
+Closes #670
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+Co-authored-by: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+
+- **testing**: Wire Codecov gates and consolidate coverage collection
+  ([#1031](https://github.com/tinaudio/synth-setter/pull/1031),
+  [`0bcf7c6`](https://github.com/tinaudio/synth-setter/commit/0bcf7c6797e0bc4ca4b901537dd779122d3c06bb))
+
+Steps 2-4 of the coverage-enforcement roadmap (#14). Builds the gating infrastructure; activation of
+  the Codecov GitHub App and CODECOV_TOKEN secret happen separately (step 1, requires org admin in
+  the UI).
+
+- Collapse the duplicate code-coverage job: every fast-suite leg (ubuntu 3.10, ubuntu 3.11, macos
+  3.10) now produces a coverage.xml and uploads under flag unit-cpu, instead of a fourth job
+  re-running the same suite. - Add [tool.coverage.run] (source, branch=true, parallel=true,
+  relative_files=true, omit) and [tool.coverage.paths] to pyproject.toml so reports from different
+  worktree paths merge cleanly. - New codecov.yml: project + patch status checks (informational for
+  the first week so we can observe before blocking), unit-cpu flag, and per-directory component
+  targets (pipeline 90%, models 85%, tools 50%, rest auto). Validated against
+  https://codecov.io/validate. - Align make coverage with CI flags (--cov-branch, xml + html
+  reports, same marker filter).
+
+Follow-ups (separate PRs): wire coverage into GPU/MPS/VST/slow workflows with their own flags; add
+  diff-cover as a fallback gate; add the Codecov badge to README; flip status checks from
+  informational to required once baseline numbers stabilize.
+
+Refs #14, #149, #155, #30
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+### Internal-Feat
+
+- **schemas**: Add EXTENSION_TO_OUTPUT_FORMAT reverse map
+  ([#1024](https://github.com/tinaudio/synth-setter/pull/1024),
+  [`ad66c78`](https://github.com/tinaudio/synth-setter/commit/ad66c78e63c65215a5e01afbc9b0737fc2eafee6))
+
+* internal-feat(schemas): add EXTENSION_TO_OUTPUT_FORMAT reverse map
+
+Add a derived reverse map alongside the existing OUTPUT_FORMAT_TO_EXTENSION in
+  synth_setter.pipeline.schemas.spec, so future WDS work — the shard writer and the shard validator
+  — can dispatch on file suffix (.h5 -> hdf5, .tar -> wds) from a single source of truth. Built via
+  dict-comprehension so adding a format stays a one-place edit on the forward map.
+
+Foundation piece only — no callers updated.
+
+Refs #874 Refs #882
+
+* internal-fix(schemas): move WDS dispatch-map tests out of pydoclint-excluded file
+
+The first commit added two test functions for the new EXTENSION_TO_OUTPUT_FORMAT constant to
+  tests/pipeline/test_schemas/test_dataset_spec.py, which is on the [tool.pydoclint].exclude list —
+  and the code-quality CI guard (scripts/check_no_new_funcs_in_pydoclint_excluded.py, see #938)
+  rejects any new top-level def in an excluded file. Cleaning up the existing file to remove it from
+  the exclude list would require fixing 12+ pre-existing DOC101 violations on methods that take
+  pytest fixture args — out of scope for a foundation PR.
+
+Instead, lift the two tests into a fresh sibling file test_format_dispatch.py, which is not in the
+  exclude regex and so is held to the full pydoclint surface from day one.
+
+Also pick up the post-#1024 doc-drift advisory:
+
+* docs/doc-map.yaml — extend the covers: list for spec.py to mention EXTENSION_TO_OUTPUT_FORMAT
+  alongside OUTPUT_FORMAT_TO_EXTENSION. * docs/design/data-pipeline.md — same edit on the
+  package-tree annotation comment for spec.py.
+
+Refs #874 Refs #882 Refs #938
+
+* internal-fix(schemas): fail fast on duplicate extension in OUTPUT_FORMAT_TO_EXTENSION
+
+Two output formats sharing an extension would silently drop an entry from the
+  EXTENSION_TO_OUTPUT_FORMAT dict-comprehension (last-key-wins) and route the wrong format
+  downstream. Guard the cardinality at module import so the mistake surfaces immediately instead of
+  as a subtle dispatch bug.
+
+Add a paired test pinning the no-collision invariant on the real constants.
+
+* docs(claude-md): fix shard_metadata.py path and reword spec_from_cfg ref
+
+Copilot review on #1024 caught two doc-drift items:
+
+- `docs/doc-map.yaml` pointed at `src/pipeline/schemas/shard_metadata.py`, which doesn't exist — the
+  module lives under `src/synth_setter/pipeline/schemas/shard_metadata.py` (residual stale path from
+  the layout migration). With the wrong glob, doc-drift checks silently skip the file. Updated to
+  the real path. - Both `docs/doc-map.yaml` and `docs/design/data-pipeline.md` described `spec.py`
+  as containing the "spec_from_cfg flow", but `spec_from_cfg` is defined in
+  `src/synth_setter/cli/generate_dataset.py`. Reworded as "consumed by spec_from_cfg in
+  cli/generate_dataset.py" so the cover notes point readers at the right module.
+
+* docs(design): fix stale src/pipeline paths in data-pipeline.md
+
+Lines 617 and 863 still pointed at the pre-#1001 layout (`src/pipeline/schemas/shard_metadata.py`).
+  The post-relocation sweep in #965 caught most refs but missed these two ShardMetadata sidecar
+  pointers.
+
+Refs #874
+
+* docs(claude-md): drop spec_from_cfg attribution for extension maps
+
+EXTENSION_TO_OUTPUT_FORMAT and OUTPUT_FORMAT_TO_EXTENSION are not yet consumed by spec_from_cfg
+  (which only builds DatasetSpec from cfg). The doc-map.yaml `covers` text and the data-pipeline.md
+  package-tree comment both implied a consumer that does not exist, which would mislead readers and
+  break doc-drift attribution for the maps. Reword to describe the inverse-pair shape and explicitly
+  note that no consumer exists yet — shard writers/validators dispatch in PR-13.
+
+Refs #1024
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **schemas**: Add ShardMetadata + wds row in OUTPUT_FORMAT_TO_EXTENSION
+  ([#976](https://github.com/tinaudio/synth-setter/pull/976),
+  [`156164a`](https://github.com/tinaudio/synth-setter/commit/156164a30795b1ac89baad85ec3bec9ae911b911))
+
+* internal-feat(schemas): add ShardMetadata + wds row in OUTPUT_FORMAT_TO_EXTENSION
+
+Plates the schema layer for the wds writer landing in PR-13:
+
+- New leaf module src/pipeline/schemas/shard_metadata.py holds the strict, frozen ShardMetadata
+  model (sidecar JSON for the wds tar's metadata.json member). No project imports — consumers on
+  either side of the src ↔ src/pipeline boundary can pick it up without forming a launcher-side
+  import cycle through pedalboard. - Extend OUTPUT_FORMAT_TO_EXTENSION from {"hdf5": ".h5"} to
+  {"hdf5": ".h5", "wds": ".tar"} and widen DatasetSpec.output_format from Literal["hdf5"] to
+  Literal["hdf5", "wds"]. The existing _shard_filenames_match_output_format model_validator now
+  defends both formats.
+
+Joins the existing schemas in the pydoclint exclude list (alongside spec.py, prefix.py,
+  image_config.py) per the convention documented at the exclude block — see #938 for the
+  cleanup-as-we-go epic.
+
+Internal-only — no config / launcher / worker changes. PR-13 splits the writer, PR-14 wires
+  --wds-out end-to-end (closes #874).
+
+Refs #975 Part of #72
+
+* docs(design): sync data-pipeline doc with ShardMetadata + Literal["hdf5", "wds"]
+
+Apply doc-drift findings from PR #976 review:
+
+- §14.1 spec sketch — drop the "wds in a later PR" trailer and widen the Literal to match spec.py's
+  new Literal["hdf5", "wds"]. - §14.7 directory tree — list the new shard_metadata.py leaf module. -
+  §7.6 finalize step + §8 WDS shard structure — reference the metadata.json sidecar (one per shard)
+  and point readers at the ShardMetadata model. - doc-map.yaml — map
+  src/pipeline/schemas/shard_metadata.py to the data-pipeline design doc so future drift checks
+  catch evolution of the sidecar contract.
+
+* internal-fix(schemas): tighten ShardMetadata sample_rate type + AST-based leaf-import test
+
+Addresses Copilot review on PR #976:
+
+- ShardMetadata.sample_rate: float → int. The h5py audio attr is written from
+  RenderConfig.sample_rate (int), so the wds sidecar mirrors the canonical type now rather than
+  drifting at the format boundary. Test payloads updated to match. - The leaf-module test now parses
+  the module's AST and asserts no ImportFrom/Import nodes targeting src.* — replaces the substring
+  grep, which would have false-failed on a docstring mentioning "from src." and missed alternative
+  import phrasings.
+
+Refs #975
+
+* ci: re-trigger test-dataset-generation after transient VST X-server flake
+
+* internal-fix(schemas): clarify ShardMetadata is not yet read by validate_shard; UTF-8 source read
+  in leaf-import test
+
+Addresses Copilot round 2 on PR #976:
+
+- ShardMetadata docstring + doc-map covers entry no longer claim the sidecar is "validated on read
+  by validate_shard". The wds writer and the wds branch of validate_shard land in PR-13; PR-12 only
+  plates the model. Reworded to reflect current behavior (model exists, wiring in PR-13). -
+  test_module_has_no_project_imports now uses Path(...).read_text(encoding="utf-8") instead of bare
+  open().read(); shard_metadata.py contains the non-ASCII ↔ glyph, so a non-UTF-8 default locale
+  (Windows) would have errored.
+
+* test(pipeline): widen leaf-import check to flag all project-import forms
+
+Addresses Copilot round 3 on PR #976:
+
+The AST check previously only caught ``import src.x`` and ``from src.x import y``. Bare ``import
+  src``, ``from src import x``, and any relative ``from .x import y`` would have bypassed it. Now
+  flags:
+
+- ast.Import: alias.name == "src" OR alias.name.startswith("src.") - ast.ImportFrom: node.level > 0
+  (any relative import) OR node.module starts with "src." OR node.module == "src"
+
+The wider check enforces the actual contract (no project-internal imports that would form a
+  launcher-side cycle), not a substring of one shape.
+
+* internal-fix(schemas): add range validators on ShardMetadata + clarify leaf-test docstring
+
+Addresses Copilot round 4 on PR #976:
+
+- ShardMetadata now runs a _ranges_must_be_sane model_validator that mirrors
+  RenderConfig._ranges_must_be_sane: velocity ∈ [0, 127], sample_rate > 0, channels >= 1,
+  signal_duration_seconds > 0. The JSON-from-R2 path is a trust boundary, so this catches
+  corrupted/hand-edited sidecars at read time rather than letting nonsensical values reach training.
+  Tests pin each rejection. - The leaf-import test docstring no longer claims generate_vst_dataset
+  imports ShardMetadata — that wiring lands in PR-13. Reworded to refer to the future consumer. -
+  Add tests/pipeline/test_schemas/test_shard_metadata.py to the pydoclint exclude — its parametrized
+  tests trip DOC101/DOC103 just like the sibling test_dataset_spec.py / test_image_config.py /
+  test_prefix.py (which are all already excluded for the same reason).
+
+* docs(design): clarify staged shards stay HDF5 regardless of output_format
+
+Addresses Copilot round 5 on PR #976. §7.6 hardcodes `.h5 + .valid` for the staged-shard existence
+  check (step 03), the structural-check open (step 04), and the promote copy (step 05). Now that
+  `DatasetSpec.output_format` accepts `wds`, a casual reader might expect staging to flip to `.tar`
+  for wds specs — but it doesn't: workers always emit HDF5; only finalize's step 08 diverges per
+  format (transcoding to wds on demand). The rationale lives in §8's "Why generation stays HDF5
+  regardless of output format" but wasn't cross-referenced from §7.6.
+
+Adds a one-line clarifier at the top of §7.6 pointing readers to the §8 note, so the
+  staging-stays-HDF5 contract is explicit without requiring the reader to find the other section.
+
+* docs(design): revert §7.6 staged-HDF5 clarifier — conflicts with schema contract
+
+Addresses Copilot round 6 on PR #976. The clarifier added in 027a2df read: "Staged shards are always
+  HDF5 regardless of spec.output_format". That's internally inconsistent with PR-12's schema, where
+  DatasetSpec.shards derives the shard filename from output_format via OUTPUT_FORMAT_TO_EXTENSION
+  (wds → .tar). Reverting the clarifier keeps §7.6 matching the only working generation path today
+  (hdf5); PR-13 will rewrite §7.6 + §8's "Why generation stays HDF5" section when the wds writer +
+  extension dispatch land.
+
+* docs(design): note §8 design-transition for wds — schema admits wds, writer lands PR-13
+
+Addresses Copilot round 7 on PR #976. Copilot rightly flagged that §8's "Why generation stays HDF5
+  regardless of output format" claim is inconsistent with the schema's output_format →
+  shard.filename wiring after PR-12. The truth is the design IS changing across PR-12/PR-13: PR-12
+  widens the spec; PR-13 lands the wds writer + extension dispatch and will rewrite §8 to match the
+  new pipeline shape.
+
+Adds a forward-looking note under §8's "Why generation stays HDF5" header that: - points readers at
+  §14.1's OUTPUT_FORMAT_TO_EXTENSION mapping, - states the eventual behavior (wds workers emit .tar
+  directly), - says PR-13 lands the writer + section rewrite, - makes clear that on main today the
+  schema admits wds but no writer is wired.
+
+---------
+
+Co-authored-by: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+
+- **vst**: Promote writer shape helpers + DATASET_FIELD_NAMES to public
+  ([#1025](https://github.com/tinaudio/synth-setter/pull/1025),
+  [`0a074b9`](https://github.com/tinaudio/synth-setter/commit/0a074b9e1a741a4cd6df8c1f7f2a49aaaebc9171))
+
+* internal-feat(vst): promote writer shape helpers + DATASET_FIELD_NAMES to public
+
+Promote the per-row array names and the audio/mel/param shape calculators inside
+  synth_setter.data.vst.generate_vst_dataset to public module-level helpers (DATASET_FIELD_NAMES,
+  audio_dataset_shape, mel_dataset_shape, param_array_dataset_shape) plus the mel-front-end
+  constants and mel_hop_length / mel_n_fft / mel_n_frames helpers. make_spectrogram and
+  create_datasets_and_get_start_idx now call the new helpers; behavior is byte-identical for the
+  existing render configs.
+
+Foundation for the upcoming WDS writer and shard-validator inner-shape checks, which need to share
+  these primitives with the validator side.
+
+Refs #874 Refs #882
+
+* internal-fix(vst): extract shape primitives to shapes.py to clear code-quality guard
+
+The first commit added six new top-level helpers (DATASET_FIELD_NAMES, mel_hop_length, mel_n_fft,
+  mel_n_frames, audio_dataset_shape, mel_dataset_shape, param_array_dataset_shape) and four
+  module-level constants to src/synth_setter/data/vst/generate_vst_dataset.py, which is on the
+  [tool.pydoclint].exclude list — and the code-quality CI guard
+  (scripts/check_no_new_funcs_in_pydoclint_excluded.py, see #938) rejects any new top-level def in
+  an excluded file. The preferred fix is to remove the source file from the exclude list, but
+  generate_vst_dataset.py has 12+ pre-existing pydoclint violations on neighbouring functions
+  (make_spectrogram, generate_sample, make_dataset, _GenerateCliArgs) — all out of scope for this
+  foundation PR.
+
+Move the new helpers to a fresh sibling module src/synth_setter/data/vst/shapes.py that was never on
+  the exclude list, so pydoclint runs on it from day one and the guard sees the new defs land in an
+  unexcluded file. generate_vst_dataset.py now imports the primitives from the new module; behaviour
+  is unchanged.
+
+Also addresses the doc-drift advisory on the misleading "single source of truth for the shard
+  validator" comment — the comment now lives in shapes.py's module docstring and hedges the
+  validator/wds writer consumers as "(planned)" since validate_shard.py still has its own private
+  _EXPECTED_DATASETS tuple.
+
+Refs #874 Refs #882 Refs #938
+
+* internal-fix(vst): wire DATASET_FIELD_NAMES into the writer's HDF5 dataset names
+
+Copilot review on PR #1025 flagged the prior "single source of truth" comment on DATASET_FIELD_NAMES
+  as overpromising: save_samples and create_datasets_and_get_start_idx still hard-coded "audio",
+  "mel_spec", "param_array" as string literals, so the constant was orthogonal to the writer. The
+  first follow-up commit (a2376d0) addressed half of that by moving the constant to shapes.py and
+  softening the comment.
+
+This commit takes the other half — actually making the constant load-bearing on the writer side:
+
+- shapes.py exposes per-field constants AUDIO_FIELD, MEL_SPEC_FIELD, PARAM_ARRAY_FIELD and builds
+  DATASET_FIELD_NAMES from them, so the tuple stays a derived view of the per-field constants. -
+  create_datasets_and_get_start_idx now passes AUDIO_FIELD / MEL_SPEC_FIELD / PARAM_ARRAY_FIELD into
+  create_dataset instead of the bare string literals. - A new shape-helpers test pins
+  DATASET_FIELD_NAMES == (AUDIO_FIELD, MEL_SPEC_FIELD, PARAM_ARRAY_FIELD) and the literal triple so
+  renaming any field still forces the validator's expected tuple to update in lockstep.
+
+save_samples doesn't reference dataset names (it operates on already-created h5py.Dataset handles),
+  so no change there.
+
+* internal-fix(vst): pass center=True explicitly to make_spectrogram's librosa call
+
+The shape helpers in shapes.py (mel_n_frames) document the librosa center=True framing assumption,
+  but make_spectrogram relied on the implicit librosa default. Pinning center=True keeps the writer
+  and the (planned) shard validator aligned on the same framing if librosa ever changes its default.
+
+Refs #1025.
+
+* fix(vst): mel_hop_length raises on sample rates that would yield zero hop
+
+Copilot review on #1025 flagged that `mel_hop_length()` returns 0 when `sample_rate <
+  MEL_FRAMES_PER_SECOND` (e.g., 50), and that 0 would later trigger a `ZeroDivisionError` inside
+  `mel_n_frames()`'s `audio_length // hop` floor-division. The schema doesn't lower-bound
+  sample_rate at this depth, so guard at the leaf helper instead of relying on upstream validation.
+
+Raises `ValueError` at the helper boundary so the failure surfaces with a clear message instead of
+  an opaque ZeroDivisionError downstream. New test pins the raise.
+
+* internal-fix(vst): guard mel_n_fft against sample rates that round to n_fft=0
+
+mel_n_fft now raises ValueError when int(0.025 * sample_rate) rounds down to 0 (e.g., sample_rate <=
+  39), mirroring the mel_hop_length guard so the failure surfaces at the leaf helper instead of as
+  an opaque librosa error downstream. Also corrects a stale phrase in the mel_hop_length docstring
+  that still referenced the pre-guard ZeroDivisionError path.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+### Testing
+
+- **vst**: Disable loudness gate during replay run to defuse #489 flake
+  ([#1023](https://github.com/tinaudio/synth-setter/pull/1023),
+  [`c5b53cb`](https://github.com/tinaudio/synth-setter/commit/c5b53cb83310179ce6be6b71f863f94b47125d00))
+
+`test_datasets_from_sampled_params_are_identical` patches `param_spec.sample` with an iterator over
+  exactly `_NUM_SAMPLES` candidate tuples. When Surge XT's nondeterministic phase init (#489) drops
+  a stage-1 candidate's loudness below `_MIN_LOUDNESS = -55 dB` on the stage-2 re-render,
+  `generate_sample`'s `while True` loop pulls the next iterator item, eventually raising bare
+  `StopIteration`.
+
+Pass `min_loudness=-inf` to the stage-2 `RenderConfig` so the gate is disabled during replay — it
+  already served its purpose in stage 1. Thread the override through `_render_cfg` and
+  `_assert_h5_structure_is_valid` (which checks the written `audio.attrs["min_loudness"]`).
+
+Closes #1022 Refs #489
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+
 ## v5.0.0 (2026-05-13)
 
 ### Chores
