@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Validate HDF5 shards against a DatasetSpec.
 
-Checks that each shard file is a valid HDF5 file, contains the expected
-datasets (audio, mel_spec, param_array), and that each dataset's row count
-matches ``spec.render.batch_per_shard``.
+Checks that each shard file is a valid HDF5 file, contains the per-row
+arrays the writer emits (``synth_setter.data.vst.shapes.DATASET_FIELD_NAMES``),
+and that each dataset's full ``.shape`` matches what those shape helpers
+predict for ``spec.render`` — i.e. ``(N, C, time)`` for audio,
+``(N, C, n_mels, n_frames)`` for the mel spectrogram, and
+``(N, num_params)`` for the param array.
 
 CLI usage:
     python3 -m synth_setter.pipeline.ci.validate_shard <spec.json|r2://bucket/spec.json>
@@ -20,10 +23,43 @@ from typing import cast
 
 import h5py
 
+from synth_setter.data.vst.shapes import (
+    AUDIO_FIELD,
+    DATASET_FIELD_NAMES,
+    MEL_SPEC_FIELD,
+    PARAM_ARRAY_FIELD,
+    audio_dataset_shape,
+    mel_dataset_shape,
+    param_array_dataset_shape,
+)
 from synth_setter.pipeline.r2_io import downloaded_to_tempfile, is_r2_uri, shard_uri
 from synth_setter.pipeline.schemas.spec import DatasetSpec
 
-_EXPECTED_DATASETS = ("audio", "mel_spec", "param_array")
+
+def _expected_dataset_shapes(spec: DatasetSpec) -> dict[str, tuple[int, ...]]:
+    """Full per-field shapes (N + inner) the writer emits for ``spec``.
+
+    Keys match ``DATASET_FIELD_NAMES``; values come from the writer's own
+    shape helpers in ``synth_setter.data.vst.shapes`` so a future renderer
+    change that drifts the audio / mel / param shapes fails fast here.
+
+    :param spec: Dataset spec whose ``render`` config and ``num_params`` parameterize
+        the per-field shapes the writer would emit for one shard.
+    :returns: Mapping with one entry per writer-emitted dataset name to its full
+        ``(N, ...)`` shape tuple.
+    :rtype: dict[str, tuple[int, ...]]
+    """
+    render = spec.render
+    num_samples = render.batch_per_shard
+    return {
+        AUDIO_FIELD: audio_dataset_shape(
+            num_samples, render.channels, render.sample_rate, render.signal_duration_seconds
+        ),
+        MEL_SPEC_FIELD: mel_dataset_shape(
+            num_samples, render.channels, render.sample_rate, render.signal_duration_seconds
+        ),
+        PARAM_ARRAY_FIELD: param_array_dataset_shape(num_samples, spec.num_params),
+    }
 
 
 def validate_shard(shard_path: Path, spec: DatasetSpec) -> list[str]:
@@ -31,10 +67,14 @@ def validate_shard(shard_path: Path, spec: DatasetSpec) -> list[str]:
 
     Checks:
     1. File opens as HDF5
-    2. Contains expected datasets: audio, mel_spec, param_array
-    3. Each dataset's row count (shape[0]) matches spec.render.batch_per_shard
+    2. Contains every dataset named in ``DATASET_FIELD_NAMES``
+    3. Each dataset's full ``.shape`` matches what
+       ``_expected_dataset_shapes`` predicts for ``spec``
 
-    Returns list of error strings (empty = valid).
+    :param shard_path: Local filesystem path to the HDF5 shard to validate.
+    :param spec: Dataset spec the shard is expected to conform to.
+    :returns: List of error strings (empty = valid).
+    :rtype: list[str]
     """
     if not shard_path.exists():
         return [f"shard file not found: {shard_path}"]
@@ -44,25 +84,30 @@ def validate_shard(shard_path: Path, spec: DatasetSpec) -> list[str]:
     except OSError:
         return [f"file is not valid HDF5: {shard_path}"]
 
+    expected_shapes = _expected_dataset_shapes(spec)
     errors: list[str] = []
     with f:
-        for name in _EXPECTED_DATASETS:
+        for name in DATASET_FIELD_NAMES:
             if name not in f:
                 errors.append(f"missing dataset: {name!r}")
                 continue
 
-            row_count = cast(h5py.Dataset, f[name]).shape[0]
-            if row_count != spec.render.batch_per_shard:
-                errors.append(
-                    f"dataset {name!r} has {row_count} rows, "
-                    f"expected {spec.render.batch_per_shard}"
-                )
+            actual = cast(h5py.Dataset, f[name]).shape
+            expected = expected_shapes[name]
+            if actual != expected:
+                errors.append(f"dataset {name!r} has shape {actual}, expected {expected}")
 
     return errors
 
 
 def _load_spec(spec_arg: str) -> DatasetSpec:
-    """Load a spec from a local path or `r2://bucket/key` URI."""
+    """Load a spec from a local path or ``r2://bucket/key`` URI.
+
+    :param spec_arg: Either a local filesystem path or an ``r2://...`` URI pointing
+        at the spec JSON file.
+    :returns: Parsed ``DatasetSpec`` instance.
+    :rtype: DatasetSpec
+    """
     if is_r2_uri(spec_arg):
         with downloaded_to_tempfile(spec_arg) as local_path:
             return DatasetSpec.model_validate_json(local_path.read_text())
@@ -70,10 +115,13 @@ def _load_spec(spec_arg: str) -> DatasetSpec:
 
 
 def validate_all_shards_from_r2(spec: DatasetSpec) -> list[str]:
-    """Validate every shard in `spec.shards` by downloading from R2.
+    """Validate every shard in ``spec.shards`` by downloading from R2.
 
-    Returns aggregated error strings across all shards (empty = all valid). Each error is prefixed
-    with the shard filename so the source is obvious.
+    :param spec: Dataset spec whose ``shards`` list drives the iteration; each
+        listed shard is fetched from R2 under ``r2://{spec.r2_bucket}/{spec.r2_prefix}``.
+    :returns: Aggregated error strings across all shards (empty = all valid). Each
+        error is prefixed with the shard filename so the source is obvious.
+    :rtype: list[str]
     """
     errors: list[str] = []
     for shard in spec.shards:
