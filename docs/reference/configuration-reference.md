@@ -77,15 +77,17 @@ Reference: `eval-pipeline.md` §4–5
 ### 2.4 Cloud Infrastructure
 
 ```
-configs/compute/{provider}-template.yaml (SkyPilot Task YAML)
+configs/compute/{provider}-template.yaml (SkyPilot Task YAML — no `run:` block)
   → launcher script (synth_setter.pipeline.skypilot_launch)
-    reads YAML, materializes spec, mounts spec into worker
+    composes DatasetSpec, uploads JSON to R2, builds the worker run-cmd
     → SkyPilot provisions pod (RunPod, Vast.ai planned, …)
-      → pod runs: python /usr/local/bin/entrypoint.py generate_dataset --spec "$WORKER_SPEC_URI"
+      → pod runs: cd /home/build/synth-setter
+                  && bash scripts/sync_worker_checkout.sh
+                  && exec synth-setter-generate-dataset-from-hydra <pinned hydra overrides>
 ```
 
 - Separate from Hydra in *consumer* (SkyPilot's `Task.from_yaml` reads the compute template), not in *composition* — the launcher itself uses Hydra's `compose()` to build the `DatasetSpec` from `configs/dataset.yaml` + the named experiment.
-- Launcher takes the task template + an `--experiment <name>`, composes the `DatasetSpec` via Hydra, uploads its JSON to R2 (under `skypilot-launcher-specs/<job>.json`), and forwards the `r2://` URI to the worker via `task.update_envs(WORKER_SPEC_URI=...)`. R2 is used instead of `task.update_file_mounts` because the SkyPilot RunPod backend rejects programmatic file_mounts with a pubkey-overflow error (see [#749](https://github.com/tinaudio/synth-setter/issues/749)).
+- Launcher takes the task template + an `--experiment <name>`, composes the `DatasetSpec` via Hydra, uploads its JSON to R2 (under `skypilot-launcher-specs/<job>.json`), and forwards the `r2://` URI to the worker via `task.update_envs(WORKER_SPEC_URI=...)` — primarily for downstream validate-time consumers (validate-spec / validate-shard CI jobs read it off the workflow output). R2 is used instead of `task.update_file_mounts` because the SkyPilot RunPod backend rejects programmatic file_mounts with a pubkey-overflow error (see [#749](https://github.com/tinaudio/synth-setter/issues/749)). The worker itself doesn't fetch the JSON — `_build_worker_cmd` pins the same Hydra overrides the launcher composed with, and the `from_hydra` entrypoint rebuilds the spec from those.
 - Invoked via: `python -m synth_setter.pipeline.skypilot_launch --experiment <name> --template <yaml>` (trailing positional args, e.g. `render.plugin_path=...`, are forwarded to Hydra `compose` as overrides).
 
 Reference: `training-pipeline.md` Appendix D
@@ -118,9 +120,7 @@ ______________________________________________________________________
 The RunPod template exists today (data-pipeline smoke). Vast.ai template not yet implemented.
 
 **RunPod** (`configs/compute/runpod-template.yaml`) — landed. Abridged
-shape (see the file for the full template; the `os._exit(0)` workaround for
-[#735](https://github.com/tinaudio/synth-setter/issues/735) lives inside the
-`generate_dataset` subcommand of `src/synth_setter/tools/docker_entrypoint.py`):
+shape (see the file for the full template):
 
 The launcher injects `image_id` per-launch via `--worker-image-tag` (default `dev-snapshot`) for non-OCI backends, so the template no longer carries a literal `image_id: docker:tinaudio/synth-setter:dev-snapshot`:
 
@@ -138,18 +138,25 @@ envs:
   RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ""
   RCLONE_CONFIG_R2_ENDPOINT: ""
   WANDB_API_KEY: ""
-  WORKER_SPEC_URI: ""                 # set by the launcher to r2://<bucket>/skypilot-launcher-specs/<job>.json
+  WORKER_GIT_REF: ""                  # PR-CI bake-lag bypass for sync_worker_checkout.sh
+  SYNTH_SETTER_WORKER_RANK: ""        # per-rank partition (synthesized by _run_workers per cell)
+  SYNTH_SETTER_NUM_WORKERS: ""
 
-run: |
-  set -euo pipefail
-  cd /home/build/synth-setter
-  bash scripts/sync_worker_checkout.sh
-  exec python /usr/local/bin/entrypoint.py generate_dataset --spec "$WORKER_SPEC_URI"
+# No `run:` block — the launcher's `_build_worker_cmd` constructs the cd +
+# sync_worker_checkout.sh + `exec synth-setter-generate-dataset-from-hydra
+# <pinned hydra overrides>` one-liner and injects it via the Task's `run`
+# field at dispatch time. Adding a `run:` block here is rejected by
+# `_load_compute_template_with_cmd`.
 ```
 
 The launcher uploads the materialized spec to R2 (under
 `r2://{bucket}/skypilot-launcher-specs/<job>.json`) rather than using
 `task.update_file_mounts(...)` — see [#749](https://github.com/tinaudio/synth-setter/issues/749).
+The spec URI is still made available to the worker pod as the
+`WORKER_SPEC_URI` env var (consumed by the CI validate-spec / validate-shard
+jobs, which read it via the workflow output rather than off the pod); the
+worker process itself re-builds the spec via Hydra compose on the injected
+overrides rather than fetching the JSON at boot.
 
 **Vast.ai** (`configs/compute/vast-template.yaml`) — planned, not implemented:
 
@@ -261,4 +268,4 @@ This document does not duplicate content from authoritative sources. Consult the
 | Training architecture                 | `training-pipeline.md`       | Phase plan, design decisions, stage definitions                |
 | Data pipeline config → spec flow      | `data-pipeline.md` §14       | Schema design, materialization, validation boundaries          |
 | Eval pipeline architecture            | `eval-pipeline.md`           | Three-stage pipeline, R2 integration, config pinning           |
-| Docker image contract                 | `docker-spec.md`             | Entrypoint modes, env vars, image targets                      |
+| Docker image contract                 | `docker.md`                  | Image targets, env vars, run patterns                          |
