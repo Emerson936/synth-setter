@@ -29,13 +29,16 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from synth_setter.data.vst.core import extract_renderer_version  # noqa: E402
 from synth_setter.pipeline import r2_io  # noqa: E402
-from synth_setter.pipeline.constants import INPUT_SPEC_FILENAME  # noqa: E402
 from synth_setter.pipeline.partitioning import (  # noqa: E402
     get_my_shards,
     read_rank_world_from_env,
 )
 from synth_setter.pipeline.schemas.skypilot_launch import SkypilotLaunchConfig  # noqa: E402
 from synth_setter.pipeline.schemas.spec import DatasetSpec, ShardSpec  # noqa: E402
+from synth_setter.pipeline.spec_io import (  # noqa: E402
+    upload_spec,
+    write_spec_locally,
+)
 
 # Composed-config keys that aren't DatasetSpec fields (interpolation sources, Hydra
 # runtime, dispatch-mode sub-trees). See configs/dataset.yaml for the live set.
@@ -139,12 +142,14 @@ def build_generate_args(spec: DatasetSpec, shard: ShardSpec, output_dir: Path) -
 
 
 def run(spec: DatasetSpec) -> None:
-    """Upload the spec to R2 once, then render+upload each owned shard in turn.
+    """Render+upload each owned shard in turn.
 
-    Spec serialization, spec upload, and the renderer-version constraint check
-    happen once pre-loop. Each shard is rendered, uploaded, and unlinked before
-    moving on — bounding local disk to one shard at a time. Subprocesses
-    fail-fast: later shards are not attempted on subprocess error.
+    Spec upload no longer happens here — ``main()`` writes the canonical R2
+    copy once on the launcher host before either calling ``run(spec)`` inline
+    (local-run) or dispatching to a SkyPilot worker pod that re-enters via
+    ``from_hydra`` → ``run(spec)``. Each shard is rendered, uploaded, and
+    unlinked before moving on — bounding local disk to one shard at a time.
+    Subprocesses fail-fast: later shards are not attempted on subprocess error.
 
     Before each render, R2 is probed for the shard's destination object: if it already exists with
     non-zero size, the shard is skipped (resumability MVP — see #750). The probe uses
@@ -183,14 +188,6 @@ def run(spec: DatasetSpec) -> None:
 
     with tempfile.TemporaryDirectory() as work_dir_str:
         work_dir = Path(work_dir_str)
-        # rclone copy preserves the source basename, and the local file is already
-        # named INPUT_SPEC_FILENAME — so the prefix-directory destination lands at
-        # `{prefix}{INPUT_SPEC_FILENAME}` without a double-name.
-        spec_path = work_dir / INPUT_SPEC_FILENAME
-        spec_path.write_text(spec.model_dump_json(indent=2))
-        logger.info(f"spec written: {spec_path}")
-        _rclone_copy(str(spec_path), r2_dest_prefix)
-        logger.info(f"spec uploaded -> {r2_dest_prefix}")
 
         rendered = 0
         skipped = 0
@@ -342,6 +339,22 @@ def main() -> None:
 
     spec = spec_from_cfg(cfg)
     sky_cfg = _sky_cfg_from_dataset_cfg(cfg)
+
+    # _REPO_ROOT (not cfg.paths.output_dir) is the anchor: the paths.* pins
+    # above are defensive shims for ${hydra:runtime.output_dir} resolution,
+    # not the operator-side artifact root.
+    spec_path = write_spec_locally(spec, _REPO_ROOT)
+    logger.info(f"wrote local spec to {spec_path}")
+
+    # Load + validate R2 creds once for the whole run, then upload the
+    # canonical spec from this single launcher-side site. Both branches benefit:
+    # local-run uses the just-loaded env for run()'s shard uploads, and the
+    # dispatch branch lets the worker boot already pointing at an existing
+    # canonical object (no per-rank re-write).
+    env_file = Path(sky_cfg.env_file).expanduser() if sky_cfg.env_file else None
+    r2_io.ensure_r2_env_loaded(env_file)
+    r2_uri = upload_spec(spec)
+    logger.info(f"spec uploaded -> {r2_uri}")
 
     if sky_cfg.compute_template is None:
         run(spec)
