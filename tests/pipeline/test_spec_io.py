@@ -127,44 +127,80 @@ class TestWriteSpecLocally:
 
 
 class TestUploadSpec:
-    """``upload_spec`` uploads the spec to its R2 URI."""
+    """``upload_spec`` uploads the spec to its R2 URI.
 
-    def test_invokes_rclone_with_input_spec_uri(self, spec: DatasetSpec) -> None:
-        """The rclone destination is the rclone-form of ``spec.r2.input_spec_uri()``.
+    State-based tests run rclone against the ``fake_r2_remote`` fixture (local-
+    typed backend rooted at a tmp dir) and assert on the materialized object's
+    bytes; one mock-based test below pins the rclone reliability-flag set,
+    which state-based tests cannot observe (see issue #1124).
+    """
 
-        :param spec: Fixture-provided ``DatasetSpec``.
-        """
-        with patch.object(r2_io.subprocess, "check_call") as mock_call:
-            spec_io.upload_spec(spec)
-        args = mock_call.call_args[0][0]
-        assert args[0] == "rclone"
-        assert args[1] == "copyto"
-        assert "--checksum" in args
-        assert args[-1] == r2_io.to_rclone_path(spec.r2.input_spec_uri())
-
-    def test_uses_reliability_flags(self, spec: DatasetSpec) -> None:
-        """Rclone command carries the same flag set as ``r2_io.upload_to_uri``.
+    def test_lands_spec_at_input_spec_uri(self, spec: DatasetSpec, fake_r2_remote: Path) -> None:
+        """Upload writes the spec to the path implied by ``spec.r2.input_spec_uri()``.
 
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
         """
-        with patch.object(r2_io.subprocess, "check_call") as mock_call:
-            spec_io.upload_spec(spec)
-        args = mock_call.call_args[0][0]
-        assert "--contimeout=30s" in args
-        assert "--timeout=300s" in args
-        assert "--retries=3" in args
+        spec_io.upload_spec(spec)
 
-    def test_returns_input_spec_uri(self, spec: DatasetSpec) -> None:
+        landed = fake_r2_remote / spec.r2.bucket / spec.r2.prefix / INPUT_SPEC_FILENAME
+        assert landed.is_file()
+
+    def test_uploaded_content_matches_spec_dump(
+        self, spec: DatasetSpec, fake_r2_remote: Path
+    ) -> None:
+        """The bytes landed at the R2 URI equal ``spec.model_dump_json(indent=2)``.
+
+        :param spec: Fixture-provided ``DatasetSpec``.
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        """
+        spec_io.upload_spec(spec)
+
+        landed = fake_r2_remote / spec.r2.bucket / spec.r2.prefix / INPUT_SPEC_FILENAME
+        assert landed.read_text(encoding="utf-8") == spec.model_dump_json(indent=2)
+
+    def test_returns_input_spec_uri(self, spec: DatasetSpec, fake_r2_remote: Path) -> None:
         """Return value equals ``spec.r2.input_spec_uri()``.
 
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
         """
-        with patch.object(r2_io.subprocess, "check_call"):
-            result = spec_io.upload_spec(spec)
+        result = spec_io.upload_spec(spec)
         assert result == spec.r2.input_spec_uri()
+
+    def test_cleans_up_tempfile_on_success(self, spec: DatasetSpec, fake_r2_remote: Path) -> None:
+        """The exact tempfile passed to rclone is unlinked after a successful copy.
+
+        Captures the source path via a pass-through wrapper around the real
+        ``subprocess.check_call`` (so the rclone copy still lands the spec on the
+        fake-local remote), then asserts the captured path no longer exists.
+        The capture is per-test so it's safe under ``pytest -n auto`` — unlike a
+        ``tempfile.gettempdir()`` glob, which races with sibling workers writing
+        their own ``tmp*.json`` files in the shared system tempdir.
+
+        :param spec: Fixture-provided ``DatasetSpec``.
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        """
+        captured_src: list[str] = []
+        real_check_call = subprocess.check_call
+
+        def _capture_then_passthrough(args: list[str]) -> None:
+            captured_src.append(args[-2])
+            real_check_call(args)
+
+        with patch.object(r2_io.subprocess, "check_call", side_effect=_capture_then_passthrough):
+            spec_io.upload_spec(spec)
+
+        assert captured_src, "rclone was not invoked"
+        assert not Path(captured_src[0]).exists()
 
     def test_cleans_up_tempfile_on_rclone_failure(self, spec: DatasetSpec) -> None:
         """Tempfile is removed even when rclone raises CalledProcessError.
+
+        Stays mock-based: ``upload_spec``'s success path covers the cleanup-on-
+        success branch (state-based above), but the error path needs a forced
+        non-zero rclone exit and there's no clean way to make local-backend
+        rclone fail without also breaking the captured tempfile path.
 
         :param spec: Fixture-provided ``DatasetSpec``.
         """
@@ -181,33 +217,23 @@ class TestUploadSpec:
         assert captured_src, "rclone was not invoked"
         assert not Path(captured_src[0]).exists()
 
-    def test_cleans_up_tempfile_on_success(self, spec: DatasetSpec) -> None:
-        """Tempfile is removed after a successful rclone copy.
+    def test_command_carries_rclone_reliability_flags(self, spec: DatasetSpec) -> None:
+        """Pin the rclone reliability-flag set + the input_spec_uri destination.
+
+        State-based tests cover the spec-lands-at-URI contract but cannot
+        observe ``--checksum / --contimeout / --timeout / --retries`` or the
+        ``rclone copyto`` verb. Losing any of those is a silent correctness
+        regression — one mock-based argv assertion guards them all.
 
         :param spec: Fixture-provided ``DatasetSpec``.
         """
-        captured_src: list[str] = []
-
-        def _record(args: list[str]) -> None:
-            captured_src.append(args[-2])
-
-        with patch.object(r2_io.subprocess, "check_call", side_effect=_record):
+        with patch.object(r2_io.subprocess, "check_call") as mock_call:
             spec_io.upload_spec(spec)
-
-        assert captured_src, "rclone was not invoked"
-        assert not Path(captured_src[0]).exists()
-
-    def test_uploaded_content_matches_spec_dump(self, spec: DatasetSpec) -> None:
-        """The bytes handed to rclone are ``spec.model_dump_json(indent=2)``.
-
-        :param spec: Fixture-provided ``DatasetSpec``.
-        """
-        captured: dict[str, str] = {}
-
-        def _record(args: list[str]) -> None:
-            captured["content"] = Path(args[-2]).read_text(encoding="utf-8")
-
-        with patch.object(r2_io.subprocess, "check_call", side_effect=_record):
-            spec_io.upload_spec(spec)
-
-        assert captured["content"] == spec.model_dump_json(indent=2)
+        args = mock_call.call_args[0][0]
+        assert args[0] == "rclone"
+        assert args[1] == "copyto"
+        assert "--checksum" in args
+        assert "--contimeout=30s" in args
+        assert "--timeout=300s" in args
+        assert "--retries=3" in args
+        assert args[-1] == r2_io.to_rclone_path(spec.r2.input_spec_uri())
