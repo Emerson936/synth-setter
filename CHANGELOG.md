@@ -1,6 +1,268 @@
 # CHANGELOG
 
 
+## v5.4.1 (2026-05-19)
+
+### Bug Fixes
+
+- **pipeline**: Rclone R2 auth + add r2-auth-probe workflow for fast repro
+  ([#1145](https://github.com/tinaudio/synth-setter/pull/1145),
+  [`9682984`](https://github.com/tinaudio/synth-setter/commit/9682984ad4382153f86cb3efc1e911a4769f514a))
+
+* ci(pipeline): add r2-auth-probe workflow for fast rclone-R2 auth repro
+
+The only workflow that exercises ensure_r2_env_loaded today is test-dataset-generation.yml via the
+  skypilot-local matrix, which takes ~7-8 minutes per run because it's downstream of the full
+  generate_dataset SkyPilot launcher. That's too slow for an investigation loop on the rclone-R2
+  auth code path.
+
+This new workflow runs ensure_r2_env_loaded() directly on ubuntu-latest in under 60 seconds with the
+  same env-var shape, triggered on PRs that touch r2_io.py / constants.py / the probe workflow
+  itself and on workflow_dispatch. Mirrors validate-dataset-shards.yaml's install step so the env is
+  comparable.
+
+Expected to FAIL on this commit (no fix applied yet) — that confirms the probe faithfully reproduces
+  the auth failure the matrix job exhibits.
+
+Refs #1143
+
+* fix(ci): gate r2-auth-probe job to same-repo PRs
+
+Fork PRs cannot read repo secrets, so the probe would always fail and waste runner minutes. Mirror
+  the gating pattern from test-skypilot-local.yml: allow workflow_dispatch unconditionally, but skip
+  pull_request events from forks.
+
+Addresses Copilot review on PR #1145.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* ci(pipeline): drop TYPE/PROVIDER from probe env to mirror failing matrix shape
+
+Initial probe set RCLONE_CONFIG_R2_TYPE=s3 and RCLONE_CONFIG_R2_PROVIDER=Cloudflare, matching
+  validate-dataset-shards.yaml. That made it pass — but the matrix step in
+  generate-dataset-shards.yaml (the actually-failing path) only sets the three secret keys; TYPE and
+  PROVIDER are not in env there.
+
+Without TYPE/PROVIDER, rclone's RCLONE_CONFIG_<remote>_<key> overrides cannot assemble a complete
+  remote definition, hence: Failed to create file system for "r2:": didn't find section in config
+  file
+
+Drop them here so the probe faithfully reproduces the failure. The fix in r2_io.py will provide the
+  defaults in-process.
+
+* fix(pipeline): default rclone R2 TYPE/PROVIDER env keys in ensure_r2_env_loaded
+
+CI's skypilot-local matrix wires only the three R2 secret env vars
+  (`RCLONE_CONFIG_R2_{ACCESS_KEY_ID,SECRET_ACCESS_KEY,ENDPOINT}`) into the
+  `synth-setter-generate-dataset` step. Without the structural `TYPE=s3` and `PROVIDER=Cloudflare`
+  keys, rclone's `RCLONE_CONFIG_<remote>_<key>` override convention cannot assemble a complete
+  remote definition, so `rclone lsd r2:` fails with:
+
+RuntimeError: rclone failed to authenticate to R2 with the resolved credentials (exit 1): Failed to
+  create file system for "r2:": didn't find section in config file
+
+Fix is minimal and in-process: `ensure_r2_env_loaded` now `os.environ.setdefault`s
+  `RCLONE_CONFIG_R2_TYPE=s3` and `RCLONE_CONFIG_R2_PROVIDER=Cloudflare` before the auth ping.
+  `setdefault` preserves caller overrides (a future non-Cloudflare S3-compatible backend can still
+  set these), so the env-override design is intact.
+
+Adds two tests under `TestEnsureR2EnvLoaded` pinning the new behavior: - defaults are applied when
+  callers don't set them - caller-provided values are not overwritten
+
+The companion `.github/workflows/r2-auth-probe.yaml` (added in the prior commit) now passes on this
+  commit; without this fix it reproduced the matrix failure in 24 seconds.
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Documentation
+
+- Drop historical narration from existing docs and code comments
+  ([#1144](https://github.com/tinaudio/synth-setter/pull/1144),
+  [`e856810`](https://github.com/tinaudio/synth-setter/commit/e8568109bc82002969b250889b50711c62ad0f4d))
+
+Sweep the offenders called out in #1140's "Out of scope" follow-up note: rewrite migration-narrating
+  prose in design docs, reference docs, getting-started, scripts/README, and two
+  `skypilot_launch.py` code comments to describe current behavior in present tense. Where the
+  rejected-alternative framing matters, keep "Rejected." but drop the "(was the original design)"
+  parentheticals so the rejected option is described in present tense too.
+
+No behavior changes — pure prose edits plus two comment-only Python edits. `make format` passes
+  cleanly.
+
+Closes #1142. Part of #441.
+
+- **claude-md**: Discourage historical narration in comments and docs
+  ([#1141](https://github.com/tinaudio/synth-setter/pull/1141),
+  [`00d9af5`](https://github.com/tinaudio/synth-setter/commit/00d9af5a51e1b3129b4032701d2be4844761e133))
+
+* docs(claude-md): discourage historical narration in comments and docs
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+### Testing
+
+- **models**: Add unit tests for KSinFeedForwardModule
+  ([#1066](https://github.com/tinaudio/synth-setter/pull/1066),
+  [`8dc12ba`](https://github.com/tinaudio/synth-setter/commit/8dc12ba5edf3c684305b83c8a955c33d6c5b2e85))
+
+* fix(models): import MSESortLoss in KSinFeedForwardModule
+
+The mse_sort dispatch branch in KSinFeedForwardModule.__init__ references MSESortLoss but only
+  ChamferLoss is imported. Calling the module with loss_fn="mse_sort" raises NameError at runtime.
+
+Refs #1063
+
+* test(models): add unit tests for KSinFeedForwardModule
+
+Add tests/models/test_ksin_ff_module.py covering construction and loss dispatch, forward and
+  model_step shape contracts, gradient flow, validation/test step wire-up to metrics,
+  configure_optimizers, the setup("fit") compile gate, and a slow single-batch overfit sanity check.
+
+The module previously had no direct unit-test coverage — only end-to-end exercise via
+  Trainer.fit(fast_dev_run=True) in tests/test_train.py.
+
+* test(models): address Copilot review feedback on KSinFeedForwardModule tests
+
+- Replace absolute /root/.claude/plans/... reference in module docstring with a self-contained
+  per-item rationale list. - Switch model_step pass-through assertions from `is` identity to
+  `torch.equal` value-equality so device/dtype refactors aren't blocked. - Derive the
+  row-permutation in test_predictions_invariant_to_batch_row_permutation from `batch_size` (flip of
+  arange) instead of hard-coding `[2, 0, 1]`, with an assertion that the perm is non-identity. -
+  Replace the brittle absolute `final_loss < 0.01` overfit threshold with a relative
+  100x-improvement check tied to `initial_loss`.
+
+* Update test_ksin_ff_module.py
+
+- **pipeline**: Address Copilot review on #1136
+  ([#1138](https://github.com/tinaudio/synth-setter/pull/1138),
+  [`7dd2861`](https://github.com/tinaudio/synth-setter/commit/7dd28611d3b28e8ba45fb984010a41e975111099))
+
+* test(pipeline): address Copilot review on #1136
+
+Two follow-ups from Copilot's PR review:
+
+- ``test_shard_generation_runs_under_headless_vst_wrapper``: assert ``len(renderer_calls) == 1``
+  before indexing ``renderer_calls[0]`` so a missing renderer call surfaces as an explicit count
+  mismatch instead of an opaque IndexError. - ``test_local_shard_file_removed_after_upload``:
+  replace the mid-flight "prior shard gone at next-renderer call" check with a ``Path.unlink`` spy
+  that delegates to the real implementation. The mid-flight check left the *final* shard's unlink
+  unobserved (the outer ``tempfile.TemporaryDirectory`` cleanup would mask a missing unlink for
+  shard N-1). The spy approach covers every uploaded shard, including the last, and a mutation that
+  drops the final ``unlink()`` now fails the test instead of silently passing.
+
+Verification (mutation test): patching production to skip ``shard_path.unlink()`` for
+  ``shard-000002`` only — a regression the prior version missed — now fails the assertion
+  ``production never called unlink() on .../shard-000002.h5``.
+
+Refs #1136 Refs #1124
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* test(pipeline): assert per-shard render/upload/unlink ordering
+
+Copilot follow-up on PR #1138: the previous version of `test_local_shard_file_removed_after_upload`
+  only checked that `Path.unlink()` was called *at some point* for each uploaded source — a
+  regression that deferred deletion until after all uploads would still pass. Record an interleaved
+  event stream of renderer/rclone/unlink ops through the existing dispatcher + a Path.unlink spy,
+  then assert the per-shard sequence `(renderer, rclone, unlink)` on the same path for every shard.
+  This proves both the disk-bounding invariant (shard N unlinks before shard N+1 renders) and
+  final-shard coverage.
+
+Also fixes a docstring wording nit ("set" → ordered event stream) and removes the now-stale `set`
+  claim.
+
+Refs #1138
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+- **pipeline**: Finish R2 mock migration in test_generate_dataset.py
+  ([#1136](https://github.com/tinaudio/synth-setter/pull/1136),
+  [`24ebde9`](https://github.com/tinaudio/synth-setter/commit/24ebde969ddd89c942e0fa4e6aa51256e647d7f7))
+
+Drop ``@patch("_rclone_copy")`` from every ``TestRun`` test that was deferred in #1128. Tests now
+  share a ``patched_subprocess`` fixture that pulls in ``fake_r2_remote`` and routes both renderer
+  and rclone ``subprocess.check_call`` invocations through ``_materialize_or_passthrough_rclone``;
+  orchestration assertions (per-shard render/upload interleaving, partitioning, skip-existing,
+  fail-fast) are now state-based on the materialized objects under the fake-local R2 remote.
+
+- ``_renderer_argv_lists`` filters the dispatcher's interleaved call list down to just the renderer
+  argv when a test needs to introspect ``generate_vst_dataset.py`` args. -
+  ``test_rclone_failure_propagates`` simulates a real rclone exit by pointing
+  ``RCLONE_CONFIG_R2_TYPE`` at a non-existent backend rather than mocking ``_rclone_copy``. -
+  ``test_local_shard_file_removed_after_upload`` now verifies the per-shard unlink mid-flight (the
+  previous test was a tautology — the outer ``tempfile.TemporaryDirectory`` cleanup wipes everything
+  on ``run()`` return). - ``test_each_shard_uploaded_after_its_render`` records (renderer, rclone)
+  events from inside the dispatcher instead of attaching mocks to a ``MagicMock`` manager.
+
+Verification: ``make test-fast`` → 1176 passed / 2 skipped; ``pre-commit run --files <test>`` green.
+
+Refs #1124 Refs #603
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+- **pipeline**: Replace R2 rclone mocks with fake-local fixture
+  ([#1128](https://github.com/tinaudio/synth-setter/pull/1128),
+  [`b818124`](https://github.com/tinaudio/synth-setter/commit/b81812482efaed6ee309b41eb65e5df808ed6fe9))
+
+* test(pipeline): replace R2 rclone mocks with fake-local fixture
+
+Migrates the R2-side test suites from `subprocess.check_call` argv-shape assertions to a
+  `fake_r2_remote` fixture that runs the real rclone binary against a local-typed remote rooted at a
+  tmp dir. Each test now asserts on the materialized filesystem state ("the file lands at the URI")
+  instead of on the rclone command line shape.
+
+Touched files: - tests/pipeline/conftest.py — new `fake_r2_remote` fixture:
+  `RCLONE_CONFIG_R2_TYPE=local` + chdir(tmp_path); skips on bare clones without rclone on PATH. -
+  tests/pipeline/test_r2_io.py — download_to_path / upload_to_uri / downloaded_to_tempfile /
+  object_size present+zero-size tests are now state-based. One mock-based argv test survives per
+  helper to pin the rclone reliability flags (`-vv / --checksum / --contimeout / --timeout /
+  --retries`) and the `lsf --format=s` probe shape; object_size's absent + probe-failure cases stay
+  mocked because the local backend errors on missing keys instead of returning empty stdout the way
+  R2 does. - tests/pipeline/test_spec_io.py — TestUploadSpec migrated to state-based; the
+  rclone-failure tempfile-cleanup test stays mocked (no clean way to force a non-zero rclone exit on
+  the local backend); one new mock-based argv test pins the reliability flags and the
+  `input_spec_uri` destination. - tests/pipeline/ci/test_validate_shard.py — R2 download path
+  exercises real rclone against shards seeded in the fake bucket; helper `_seed_r2_shards` shared by
+  the four migrated tests. - tests/pipeline/test_entrypoints/test_generate_dataset.py — one
+  shard-upload test migrated to assert on R2 file-landing; the surrounding orchestration tests keep
+  mock-based call-count + ordering assertions since those don't touch the rclone command shape that
+  #1124 targets.
+
+`make test-fast`: 1152 passed, 2 skipped. Pre-commit: pydoclint / ruff / pyright / interrogate green
+  on all touched files.
+
+Refs #1124 Refs #603
+
+* fix(tests): make spec_io tempfile-cleanup test parallel-safe
+
+The previous version of test_cleans_up_tempfile_on_success globbed `tempfile.gettempdir()` for
+  `tmp*.json` before and after `upload_spec`, expecting equality. Under `pytest -n auto`, sibling
+  workers concurrently create/remove their own `NamedTemporaryFile` instances in the shared system
+  tempdir, so the count drifts between the two snapshots and the test fails non-deterministically
+  (observed `assert 0 == 1` — a sibling worker happened to clean up its tempfile between the two
+  measurements).
+
+Replace the count-delta with a per-test capture: wrap `subprocess.check_call` with a side effect
+  that records the source path (`args[-2]`, the tempfile that `upload_spec` wrote), then calls the
+  real subprocess so the rclone copy still lands the spec on the fake-local remote. After the call
+  returns, assert the captured path no longer exists. Same shape as the rclone-failure cleanup test,
+  just without the forced exception.
+
+Refs #1124
+
+
 ## v5.4.0 (2026-05-19)
 
 ### Chores
