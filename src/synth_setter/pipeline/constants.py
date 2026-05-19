@@ -28,7 +28,7 @@ R2_URI_SCHEME = f"{RCLONE_REMOTE}://"
 # Per-launch R2 key prefix where ``skypilot_launch.upload_spec_to_r2`` writes
 # a per-job transport copy of the materialized spec as ``<job_name>.json``
 # (workaround for #749 file_mounts — the object key is the job name, not
-# ``input_spec.json``). Shared with ``pipeline.ci.spec_uri`` so the launcher
-# and the CI helper that reconstructs ``WORKER_SPEC_URI`` stay in lockstep
-# without ``spec_uri`` importing the heavy SkyPilot SDK.
+# ``input_spec.json``). Only the launcher reads this now; ``pipeline.ci.spec_uri``
+# no longer imports it (see #1115). The prefix itself retires once #749 is
+# upstream-fixed.
 LAUNCHER_SPEC_R2_PREFIX = "skypilot-launcher-specs"
