@@ -1,6 +1,79 @@
 # CHANGELOG
 
 
+## v8.2.0 (2026-05-20)
+
+### Features
+
+- **data-pipeline**: Renderconfig.parallel + max_retries — concurrent shard renders in run()
+  ([#1189](https://github.com/tinaudio/synth-setter/pull/1189),
+  [`5631bf1`](https://github.com/tinaudio/synth-setter/commit/5631bf1acc8b92b84741089bb8b7180b54310082))
+
+* feat(data-pipeline): add RenderConfig.parallel + max_retries for concurrent shard renders
+
+`run()` now dispatches owned shard renders through a `ThreadPoolExecutor` when
+  `render.parallel=True`, with pool size = `min(max(1, available_cpus() // 2), len(my_range))`. The
+  `// 2` heuristic leaves headroom for each renderer subprocess's own multi-threaded numerical code
+  (librosa / pedalboard / BLAS); the `min(..., len(my_range))` cap avoids idle workers when a rank
+  owns fewer shards than the heuristic returns. Applies on both local-run and SkyPilot-worker entry
+  paths (same `run()`).
+
+A new `RenderConfig.max_retries: int = 0` field bounds a per-shard retry loop around the renderer
+  `subprocess.check_call` for transient X11/Xvfb init failures; rclone stays outside the loop
+  (already retries via `--retries=3`).
+
+`_render_one_owned_shard(...)` factors the R2 skip-probe + render+upload call so the new serial /
+  parallel arms share one callable. New module helper `available_cpus()` lives next to
+  `read_rank_world_from_env`.
+
+Tests: - 3 unit tests for `available_cpus()` (Linux affinity / portable fallback / None). - 2
+  behavioural tests for retry semantics (recovery + budget exhaustion). - 2 behavioural tests for
+  parallel dispatch (state-based completion + fail-fast). - Linux-only stress integration test
+  (gated by `slow` + `requires_vst` markers) that answers the X11-wrapper isolation question on the
+  dev-snapshot image.
+
+Refs #1188
+
+* test(data-pipeline): pin available_cpus in parallel-dispatch tests for deterministic pool sizing
+
+Address ml-test BLOCK from repo-review-full-no-comments: the original
+  `test_parallel_render_uses_thread_pool_and_uploads_all_shards` only asserted `len(thread_ids) >=
+  1`, which a serial run also satisfies. Pin `available_cpus` via monkeypatch and synchronize the
+  dispatcher stub so the pool must serve at least 2 distinct threads before any render completes.
+  Tighten the fail-fast test in the same way (pool=2, assert `landed <= 1` and `renderer_call_count
+  <= 2`).
+
+* docs(data-pipeline): document RenderConfig.parallel + max_retries
+
+Address doc-drift advisory for PR #1189: - `docs/doc-map.yaml`: `covers` description for
+  `generate_dataset.py` now reflects the optional thread-pool dispatch + retry loop. -
+  `docs/design/data-pipeline.md` §1 implementation-status callout: add the parallel-dispatch +
+  retry-budget sentence. - `docs/design/data-pipeline.md` §2 Typical Workflow comment: soften
+  "sequential multi-shard" since `render.parallel=true` opts into thread-pool dispatch. -
+  `docs/design/data-pipeline.md` §14.1 `RenderConfig` snippet: add the two new fields between
+  `samples_per_shard` and `plugin_reload_cadence`.
+
+* refactor(data-pipeline): producer/consumer dispatch in _dispatch_shards_parallel
+
+Submit at most ``workers`` shards at a time and only enqueue a replacement after every completion in
+  the current batch has been observed without error. With the prior all-at-once ``submit(...) for
+  sid in my_range``, a worker thread freed by a failing render could pick up another queued shard
+  before the main thread observed the failure and called ``shutdown(cancel_futures=True)``,
+  weakening fail-fast/cancellation semantics. Waves of submissions close that window: no shard
+  beyond the in-flight set can start once a failure surfaces.
+
+Also reword ``_render_and_upload_shard``'s "bounds local disk to one shard at a time" — under
+  ``render.parallel=True`` the bound applies per worker thread, so peak local disk scales with the
+  pool size.
+
+* test(data-pipeline): fix available_cpus test on macOS (no sched_getaffinity)
+
+`monkeypatch.setattr(os, "sched_getaffinity", ...)` raises by default when the attribute is missing
+  — but on macOS/Windows `sched_getaffinity` is Linux-only and never present, so the test failed
+  under `run_tests_macos`. Add `raising=False` so the test still exercises the "present" branch of
+  `available_cpus()` on every platform.
+
+
 ## v8.1.0 (2026-05-20)
 
 ### Features
