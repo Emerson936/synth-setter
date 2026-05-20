@@ -1,6 +1,301 @@
 # CHANGELOG
 
 
+## v8.5.0 (2026-05-20)
+
+### Continuous Integration
+
+- **data-pipeline**: Nightly schedule exercises RenderConfig.parallel end-to-end
+  ([#1201](https://github.com/tinaudio/synth-setter/pull/1201),
+  [`c0d01af`](https://github.com/tinaudio/synth-setter/commit/c0d01afbf16c456973b07ce0dce6039cdd99625a))
+
+* ci(data-pipeline): add nightly schedule exercising RenderConfig.parallel end-to-end
+
+Adds a scheduled workflow (cron 0 5 * * * UTC + workflow_dispatch) that runs
+  `synth-setter-generate-dataset` inline in the dev-snapshot Docker image with
+  `+render.parallel=true` against the real Surge XT VST3 and real Cloudflare R2, then validates the
+  produced spec + every shard via the existing `synth_setter.pipeline.ci` helpers. Closes #1197;
+  refs #1189 (the parallel feature) and #1195 (the cross-platform unit-tier integration test this
+  complements).
+
+The Linux Xvfb stress integration test (`tests/integration/test_parallel_shard_render_linux.py`) is
+  gated by `slow + requires_vst + skipif(linux)` and never runs in default CI; the cross-platform
+  test (`test_parallel_shard_dispatch.py`) drives a fake renderer script, not the real VST. This
+  workflow is the missing surface: real Xvfb wrapper + real plugin + real R2 writes under
+  `ThreadPoolExecutor` dispatch, so regressions in the parallel-dispatch path surface overnight.
+
+Inputs are sized for nightly cost: 32 samples / 4 shards / 8 samples per shard via the new
+  `configs/experiment/generate_dataset/nightly-parallel-smoke.yaml`. The ephemeral R2 prefix
+  `nightly-parallel/<run_id>/<run_attempt>/<nonce>/` is purged in an `if: always()` cleanup step so
+  failed runs don't leak objects. On scheduled failure, an auto-issue is filed under Phase 6 (#73)
+  following the existing `cpu-slow.yml` dedupe pattern.
+
+* ci(data-pipeline): fix nightly workflow review BLOCKs
+
+Two correctness fixes from the pre-PR review:
+
+1. **Broken spec_uri extraction.** The `::synth-setter-spec-uri::` sentinel is only emitted by
+  `dispatch_via_skypilot()`, not by the inline `run(spec)` path the nightly takes (compute_template
+  stays unset). Replaced the grep-the-launcher-log approach with the same pattern
+  `generate-dataset-shards.yaml:491-498` uses: glob the workspace for
+  `data/<task>/<run_id>/metadata/input_spec.json` (the file `write_spec_locally` always produces)
+  and synthesise the R2 URI from `spec.r2.bucket` + `spec.r2.prefix`. Single source of truth, no
+  marker-emission contract to honour.
+
+2. **Off-root R2 layout.** The previous `+r2.prefix=nightly-parallel/...` override dropped
+  `prefix_root=data/` entirely, violating the pipeline invariant. Switched to a
+  `task_name=nightly-parallel-<run>-<attempt>-<nonce>` override and let `_fill_default_r2_prefix`
+  auto-fill `r2.prefix = data/<task_name>/<run_id>/`. Cleanup now scopes off `data/<task_name>/`
+  (falls back when the spec_uri step never resolved the full prefix).
+
+Plus the two high-signal WARNs from the same review:
+
+- `RenderConfig.max_retries` stays at the default 0 (strict fail-fast) so a real Xvfb concurrency
+  regression isn't masked by a silent retry — defeats the workflow's purpose. - Auto-issue now
+  mirrors `cpu-slow.yml` exactly: `--assignee ktinubu`, `--milestone "ci-automation v1.0.0"`, parent
+  `Phase 1 (#150)` so the milestone-parent alignment honours the taxonomy.
+
+Refs #1197
+
+* fix(ci): nightly workflow Hydra override + experiment-yaml allowlist
+
+Two correctness fixes caught by Level-3 verification on PR #1201:
+
+1. **Hydra `+render.parallel=true` collides with the experiment YAML.** `+` is Hydra's add-new-key
+  syntax; using it on a key that's already set (`nightly-parallel-smoke.yaml` declares
+  `render.parallel: true`) raises `ConfigCompositionException` at compose time, so every nightly run
+  would die before generating a shard. Switched to `++render.parallel=true` (force-set), which keeps
+  the workflow-level coverage signal (regression in the YAML can't silently disable parallel
+  dispatch) while remaining robust to whether the key is already in cfg.
+
+2. **`nightly-parallel-smoke` missing from `DATASET_EXPERIMENTS` allowlist.**
+  `tests/pipeline/test_configs/test_experiment_yamls.py` is a curated allowlist (per the module
+  docstring), not a directory scan — every new datagen experiment YAML must be added explicitly.
+  Without this entry, future config breakage in `nightly-parallel-smoke.yaml` wouldn't catch in CI
+  until the nightly fired.
+
+Verified via an inline compose check: `++render.parallel=true` +
+  `task_name=nightly-parallel-<id>-<attempt>-<nonce>` produces a spec with `r2.prefix =
+  data/<task>/<run_id>/`, and the workflow's spec-uri-resolution glob
+  (`data/<task>/*/metadata/input_spec.json`) matches the file `write_spec_locally` produces —
+  single-file match, no glob explosion.
+
+* docs(ci): apply doc-drift fixes to nightly workflow + doc-map
+
+Two findings from the doc-drift advisory on PR #1201:
+
+1. **doc-map covers entry referenced the OLD R2 prefix layout.** Prior design had
+  `nightly-parallel/<run_id>/<attempt>/<nonce>/`; the post-review-BLOCK design uses the launcher's
+  auto-fill of `data/<task_name>/<run_id>/` with a per-run-unique task_name. Updated the covers
+  blurb to describe what the workflow actually does (and to mention the `++render.parallel=true`
+  Hydra-override syntax landed in the previous commit).
+
+2. **Header comment's `skipif(linux)` shorthand reads as "skip on Linux".** The actual marker in
+  `test_parallel_shard_render_linux.py` is `skipif(sys.platform != "linux")` — the skip fires on
+  NON-Linux. Reworded to "Linux-only stress test" to remove the ambiguity.
+
+* fix(ci): drop unused /run-metadata bind mount
+
+Addresses Copilot inline comment 3271891191 on PR #1201: the ``-v
+  "${RUN_METADATA_DIR}:/run-metadata"`` mount was never read inside the container — the
+  generate-step writes only to the host-side ``${RUN_METADATA_DIR}/generate.log`` via ``tee``, and
+  the upload-artifact step picks it up from the host path. Removing the dead mount shrinks the
+  docker invocation and matches the principle of "no unused options".
+
+* docs(ci): fix stale comment bullets in nightly workflow
+
+Two header bullets described behavior the workflow no longer uses (PR #1201 review feedback from
+  Copilot):
+
+- ``+r2.prefix=${R2_PREFIX}`` bullet → rewritten to describe the actual ``task_name=...`` driven
+  prefix scoping (no explicit ``r2.prefix`` override; the launcher derives it from ``task_name``). -
+  ``tee → spec_uri marker`` bullet → rewritten to reflect that ``spec_uri`` is now resolved from the
+  local materialized spec (``write_spec_locally`` path), not grepped from the log; the ``tee``
+  exists for upload-artifact post-failure triage.
+
+Also fixes ``+render.parallel`` → ``++render.parallel`` in the adjacent bullet so the comment
+  matches the actual override flag fixed in 48d6b31.
+
+Refs #1201
+
+### Features
+
+- **data-pipeline**: Synth-setter-finalize-dataset hdf5 branch (download + reshard + stats)
+  ([#1202](https://github.com/tinaudio/synth-setter/pull/1202),
+  [`dbb0077`](https://github.com/tinaudio/synth-setter/commit/dbb0077d35a4ca7a72fa7270aafc6df1f131293b))
+
+* feat(data-pipeline): finalize_hdf5 downloads, reshards, uploads splits + stats
+
+Replace the Phase-1 NotImplementedError stub with a working body that downloads every shard from R2,
+  writes input_spec.json next to them, runs reshard for the {train,val,test}.h5 virtual datasets,
+  computes stats.npz over the train split, and uploads each split file plus stats.npz to its
+  canonical r2.split_h5_uri/r2.stats_uri. main() still writes dataset.complete last per
+  pipeline/CLAUDE.md.
+
+Refs #1183
+
+* fix(data-pipeline): address Copilot review on finalize_hdf5 (rclone path form, empty train guard,
+  h5/dask cleanup)
+
+- Switch shard download from ``_rclone_copy`` (rclone-form input) to ``r2_io.download_to_path`` (URI
+  input), so ``spec.r2.shard_uri(...)`` values flow straight through without a manual ``r2://`` →
+  ``r2:`` translation. Mirrors how ``_download_train_shards_one_at_a_time`` fetches wds shards and
+  makes the dest path explicit (file→file ``rclone copyto``) rather than directory-coerced. - Guard
+  ``finalize_hdf5`` against an empty train split before any download work, mirroring the existing
+  guard in ``finalize_wds``. Without it, ``reshard`` prunes ``train.h5`` and ``get_stats_hdf5``
+  later fails with a low-signal HDF5 error. - Scope ``Client`` and ``h5py.File`` inside ``with``
+  blocks in ``get_stats_hdf5`` so the Dask cluster's worker processes/threads and the HDF5 file
+  handle are released on return. Required now that the in-process CLI calls it directly. - Test
+  ``test_finalize_hdf5_raises_on_empty_train_split`` pins the new guard; existing hdf5 tests rebind
+  from ``_rclone_copy`` to ``download_to_path`` to match the new transport contract.
+
+Refs #1202
+
+* refactor(data-pipeline): tighten finalize_hdf5 contracts + tests (PR #1202 review)
+
+Addresses ktinubu's self-review warns and trivial nits on PR #1202; ignores nits that would require
+  cross-file refactors (write_spec_locally, _SPLIT_LABELS retyping, threading stats_out through
+  get_stats_hdf5).
+
+finalize_dataset.py: - Drop ``# type: ignore[misc]`` on ``reshard.main.callback(...)`` in favor of
+  ``assert reshard.main.callback is not None`` — narrows Click's stub typing without a broad mypy
+  waiver. - Assert ``stats.npz`` exists after ``get_stats_hdf5(...)`` so the helper's implicit
+  output-path contract (derived via ``SurgeXTDataset.get_stats_file_path``) is pinned at the call
+  site; drift now fails loud here instead of inside ``r2_io.upload``. - Extend the docstring to
+  record that structural validation is delegated to ``reshard._write_split``'s h5py opens (per
+  ``pipeline/CLAUDE.md``'s "finalize runs structural validation only" rule) and to document the
+  stats output-path dependency. - Log each uploaded split URI + stats URI, mirroring the wds
+  branch's per-artifact log message (operator-visible audit trail symmetry).
+
+test_finalize_dataset.py: - ``_seed_shard_files`` now sources its shapes from
+  ``audio_dataset_shape`` / ``mel_dataset_shape`` / ``param_array_dataset_shape`` in
+  ``synth_setter.data.vst.shapes`` rather than hard-coded ``(*, 2, 64)`` / ``(*, 2, 8, 8)`` / ``(*,
+  12)`` literals. If the writer's source-of-truth shape helpers ever drift, the test follows
+  automatically. - ``test_hdf5_finalize_produces_train_consumable_layout`` now asserts every shard
+  is downloaded (``downloaded_uris == [shard_uri for shard in spec.shards]``) — a regression that
+  narrowed the loop to train shards only would otherwise silently drop val/test outputs. -
+  ``test_main_hdf5_branch_uploads_marker_last`` tightens the marker- last invariant: every artifact
+  URI's index in ``upload_order`` must be strictly less than the marker's index (generalizes to
+  splits- with-val-test, not just the train-only smoke case). - New
+  ``test_finalize_hdf5_propagates_stats_failure_before_marker_upload`` pins that a
+  ``get_stats_hdf5`` exception (the real ``_check_degenerate_bins`` failure mode) propagates out of
+  ``finalize_hdf5`` and prevents any split / stats / marker upload.
+
+* refactor(data-pipeline): finalize_hdf5 e2e tests, reshard pure-function extraction, VDS path fix
+  (#1202)
+
+- reshard: extract ``reshard_dataset(dataset_root, spec_uri=None)`` pure function; ``main`` becomes
+  a thin Click adapter that delegates to it. ``finalize_hdf5`` now calls
+  ``reshard_dataset(work_dir)`` directly instead of routing through ``reshard.main.callback`` (no
+  more Click internals leakage). - reshard VDS portability: ``_write_split`` now passes
+  ``shard_path.name`` (relative basename) to ``h5py.VirtualSource`` instead of the absolute
+  ``Path``. The resulting ``{train,val,test}.h5`` resolves against any directory that holds sibling
+  shards — fixes the absolute-temp-dir embedding that would have broken a download-then-train
+  workflow. - spec_io: add ``write_spec_to_path(spec, target)`` that writes to an explicit
+  filesystem path (must end in ``input_spec.json``). ``write_spec_locally`` becomes a thin wrapper
+  for the nested operator-side layout. ``finalize_hdf5`` uses ``write_spec_to_path`` for the flat
+  ``work_dir/input_spec.json`` placement and the docstring explains why the layout diverges (reshard
+  is the only consumer; the ``data/<task>/<run>/metadata/`` hierarchy would be ceremony with no
+  downstream reader). - Real e2e regression: ``test_finalize_hdf5_real_shards_end_to_end`` uses the
+  ``fake_r2_remote`` fixture (local-typed rclone remote, no ``subprocess.check_call`` mocks) to run
+  ``finalize_hdf5`` end-to-end against seeded h5 shards. After the call returns the work_dir is
+  wiped; the uploaded ``train.h5`` is read back from the staging location with sibling shards and an
+  ``audio[0]`` row is dereferenced to prove the VDS sources resolve. - test docstring nit (Copilot):
+  line 347 now references ``download_to_path`` (the actual patched target) instead of the obsolete
+  ``_rclone_copy``.
+
+* test(data-pipeline): expand finalize_hdf5 + get_stats_hdf5 coverage (P0/P1/P2)
+
+Addresses review #pullrequestreview-4330448087 on PR #1202 with nine new tests + one P0 helper
+  extraction. New tests state-based against ``fake_r2_remote`` where they touch transport (P3
+  fixture migration); failure-injection tests wrap the real function only where state-based
+  verification has no alternative.
+
+P0 — cover the actual code change (in ``tests/pipeline/data/test_stats.py``): -
+  test_get_stats_hdf5_closes_dask_client_and_h5_file: SpyClient subclass records the instance;
+  asserts ``status == "closed"`` and ``h5py.File(path).id.valid`` after the call returns. -
+  test_get_stats_hdf5_writes_sibling_stats_npz_with_mean_std_keys: real-execution path, no stubs;
+  pins ``SurgeXTDataset.get_stats_file_path`` derivation, ``{"mean", "std"}`` schema, dtype
+  preservation, and shape. - test_get_stats_hdf5_callable_twice_in_same_process: two back-to-back
+  calls against the same shard prove no leaked Client port + no stale h5py handle (the regression
+  scenario for the new ``with`` blocks).
+
+P1 — cover new conditionals in ``finalize_hdf5`` (in
+  ``tests/pipeline/test_entrypoints/test_finalize_dataset.py``): -
+  test_finalize_hdf5_only_uploads_splits_that_reshard_wrote: spec with ``val=(0,0)/test=(0,0)``;
+  only ``train.h5`` + ``stats.npz`` land at the fake remote, no phantom val/test artifacts. -
+  test_finalize_hdf5_propagates_split_upload_failure_before_stats_upload: wrap ``r2_io.upload`` to
+  raise on the first ``.h5`` destination; assert ``stats.npz``/``dataset.complete`` never appear at
+  the remote. - test_finalize_hdf5_writes_input_spec_json_sibling_to_shards: spy on
+  ``reshard_dataset`` to capture the work_dir contents at invocation time; pin ``input_spec.json``
+  is sibling to every downloaded shard before reshard runs (so reshard's default-spec discovery
+  works).
+
+P2 — adversarial / implicit-contract coverage (same file): -
+  test_finalize_hdf5_rejects_structurally_invalid_shard: garbage bytes at the first shard URI;
+  reshard's h5py open raises and no split or stats artifact lands at the remote. -
+  test_finalize_hdf5_temp_work_dir_is_torn_down_on_failure: stub ``finalize_hdf5`` to raise, capture
+  the live tempdir path before the raise, assert ``.exists() is False`` after the bubbled exception.
+  - test_finalize_hdf5_marker_idempotency_short_circuits_before_download: non-None ``object_size``
+  for the marker URI makes ``main()`` return before any ``download_to_path``/``upload`` call fires
+  (hdf5 branch).
+
+P3 — fixture migration: every new test uses ``fake_r2_remote`` for download/upload (state-based
+  against materialized files under the fake remote), modeled on
+  ``test_finalize_hdf5_real_shards_end_to_end``. The pre-existing
+  ``test_hdf5_finalize_produces_train_consumable_layout`` remains as the interaction-based
+  reference; its migration is tracked as follow-up.
+
+* fix(data-pipeline): convert stats_npz assert to explicit raise (Copilot review)
+
+Address Copilot inline finding on PR #1202: the `assert stats_npz.is_file()` guard in
+  `finalize_hdf5` is stripped under `python -O`, which would skip the contract check and surface as
+  a less-targeted error inside `r2_io.upload`. Replace with an `if not ...: raise
+  FileNotFoundError(...)` so the guard is enforced unconditionally. Update the docstring's
+  `:raises:` block accordingly.
+
+The dask-pattern cleanup finding on `stats.py:189` was deferred per the maintainer's reply
+  (numerical-correctness tests are a prerequisite) and is now tracked in #1210.
+
+### Testing
+
+- **data-pipeline**: Add always_on real-plugin integration test (Linux)
+  ([#1199](https://github.com/tinaudio/synth-setter/pull/1199),
+  [`0dfb9b7`](https://github.com/tinaudio/synth-setter/commit/0dfb9b73a4f8e7d2ff3d5cebeaceb54d992f6a0a))
+
+* test(data-pipeline): add always_on real-plugin integration test (Linux + Darwin)
+
+End-to-end shard render with ``gui_toggle_cadence="always_on"`` and
+  ``plugin_reload_cadence="once"``. Runs through the existing CI matrix:
+
+- Linux Docker via ``docker/ubuntu22_04/run-linux-vst-headless.sh`` (Xvfb + xsettingsd + openbox +
+  dbus) — exercises the off-main-thread editor path on X11. - macOS runner — exercises the
+  off-main-thread editor path on Cocoa, the empirical check the design called out as the open
+  question.
+
+Asserts the shard completes with all rows written, the HDF5 file is well-formed, and no
+  ``vst-editor-window crashed`` record is emitted.
+
+Refs #1187
+
+* fix(testing): tighten always_on integration test + wire it into CI
+
+Address pre-PR review BLOCKs:
+
+- Add the new test file to ``.github/workflows/test-vst-slow.yml``'s pytest invocation — previously
+  the workflow ran only ``tests/data/vst/test_generate_vst_dataset.py`` by name, so the new test was
+  never collected anywhere. - Drop the macOS Cocoa claim from the docstring; no current workflow
+  runs ``requires_vst + slow`` tests on a macOS runner with Surge XT installed. macOS coverage
+  tracked as a follow-up. - Replace the ``caplog`` crash assertion (loguru doesn't propagate to the
+  stdlib handler — it was a tautology) with a ``monkeypatch.setattr`` on ``core.logger``; the
+  editor-thread crash gate is now observable. - Tighten shard assertions: ``mel_spec`` and
+  ``param_array`` datasets present, audio finite, audio within ``[-1, 1]``. - Force a mid-shard
+  flush (``samples_per_render_batch=2`` with ``samples_per_shard=4``) so the cross-flush invariant
+  of the held-open scope is actually exercised.
+
+Refs #1193
+
+
 ## v8.4.1 (2026-05-20)
 
 ### Bug Fixes
