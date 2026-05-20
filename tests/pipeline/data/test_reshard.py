@@ -1,39 +1,41 @@
-"""Behavioral tests for `synth_setter.pipeline.data.reshard`.
+"""Behavioral tests for ``synth_setter.pipeline.data.reshard``.
 
-The reshard CLI consumes ``DatasetSpec.train_val_test_sizes`` from
-``<dataset_root>/input_spec.json`` as the authoritative source of per-split
-sample counts. Shard counts are derived as
-``size // render.samples_per_shard``; the legacy ``--train-samples`` /
-``--val-samples`` / ``--test-samples`` defaults are gone.
+The CLI reads ``DatasetSpec.train_val_test_sizes`` from
+``<dataset_root>/input_spec.json`` and derives per-split shard counts as
+``size // render.samples_per_shard``. Shard filenames are taken verbatim from
+``spec.shards``; the on-disk shape and dtype of each shard are revalidated at
+the reshard boundary before any output handle opens. All split outputs are
+staged under ``.tmp-<split>.h5`` and renamed only after every split's staging
+write succeeds (across-splits atomicity).
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
-from unittest import mock
 
 import h5py
 import numpy as np
 import pytest
 from click.testing import CliRunner
 
+from synth_setter.data.vst.shapes import DATASET_FIELD_NAMES
 from synth_setter.pipeline.constants import INPUT_SPEC_FILENAME
 from synth_setter.pipeline.data import reshard as _reshard_module
 from synth_setter.pipeline.schemas.spec import DatasetSpec
 
+# Pinned timestamp for ``patch_runtime_io``'s ``_utc_now`` monkeypatch.
 FIXED_NOW = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _render_kwargs(samples_per_shard: int) -> dict[str, Any]:
     """Return RenderConfig kwargs with the given ``samples_per_shard``.
 
-    :param samples_per_shard: Sample count per shard; drives reshard's
-        per-split shard count via ``size // samples_per_shard``.
-    :returns: Dict suitable as ``render`` input for ``DatasetSpec``.
-    :rtype: dict[str, Any]
+    :param samples_per_shard: Per-shard row count; drives the spec-derived
+        shard count via ``size // samples_per_shard``.
+    :returns: Mapping suitable as ``render`` input for ``DatasetSpec``.
     """
     return {
         "plugin_path": "/fake/Plugin.vst3",
@@ -57,14 +59,13 @@ def _spec_kwargs(
     *,
     samples_per_shard: int,
 ) -> dict[str, Any]:
-    """Return DatasetSpec kwargs that produce the requested (train, val, test) split.
+    """Return DatasetSpec kwargs producing the requested ``(train, val, test)`` split.
 
-    :param train: Sample count for the train split.
-    :param val: Sample count for the val split.
-    :param test: Sample count for the test split.
-    :param samples_per_shard: Shard granularity; each split must be a multiple.
-    :returns: Dict suitable as ``**kwargs`` for ``DatasetSpec``.
-    :rtype: dict[str, Any]
+    :param train: Sample count for the train split; must be a multiple of ``samples_per_shard``.
+    :param val: Sample count for the val split; must be a multiple of ``samples_per_shard``.
+    :param test: Sample count for the test split; must be a multiple of ``samples_per_shard``.
+    :param samples_per_shard: Shard granularity; passed through to ``render`` kwargs.
+    :returns: Mapping suitable as ``**kwargs`` for ``DatasetSpec``.
     """
     return {
         "task_name": "reshard-test",
@@ -81,7 +82,7 @@ def patch_runtime_io(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub git/timestamp factories so DatasetSpec construction is deterministic.
 
     :param monkeypatch: Pytest monkeypatching fixture used to override the
-        factory functions on ``synth_setter.pipeline.schemas.spec``.
+        non-pure factory functions on ``synth_setter.pipeline.schemas.spec``.
     """
     monkeypatch.setattr("synth_setter.pipeline.schemas.spec._get_git_sha", lambda: "abc123def456")
     monkeypatch.setattr("synth_setter.pipeline.schemas.spec._is_repo_dirty", lambda: False)
@@ -91,8 +92,11 @@ def patch_runtime_io(monkeypatch: pytest.MonkeyPatch) -> None:
 def _write_shard(path: Path, shard_size: int) -> None:
     """Write a minimal HDF5 shard with the three datasets reshard expects.
 
+    Shapes and dtypes match the contract that
+    :func:`synth_setter.pipeline.ci.validate_shard.check_shard_contracts` enforces.
+
     :param path: Destination filesystem path for the shard.
-    :param shard_size: Number of samples (rows) the shard should advertise.
+    :param shard_size: Required leading-axis length for every dataset.
     """
     with h5py.File(path, "w") as f:
         f.create_dataset("audio", shape=(shard_size, 2, 64), dtype=np.float32)
@@ -100,14 +104,11 @@ def _write_shard(path: Path, shard_size: int) -> None:
         f.create_dataset("param_array", shape=(shard_size, 12), dtype=np.float32)
 
 
-def _materialize_dataset(
-    dataset_root: Path,
-    spec: DatasetSpec,
-) -> None:
-    """Write ``input_spec.json`` and all ``shard-NNNNNN.h5`` files under ``dataset_root``.
+def _materialize_dataset(dataset_root: Path, spec: DatasetSpec) -> None:
+    """Write ``input_spec.json`` and every ``shard-NNNNNN.h5`` under ``dataset_root``.
 
-    :param dataset_root: Directory that will hold the spec JSON and shards.
-    :param spec: Spec that describes the layout to materialize.
+    :param dataset_root: Directory to populate; created if missing.
+    :param spec: Spec whose ``shards`` define the layout to materialize.
     """
     dataset_root.mkdir(parents=True, exist_ok=True)
     (dataset_root / INPUT_SPEC_FILENAME).write_text(spec.model_dump_json())
@@ -117,23 +118,31 @@ def _materialize_dataset(
 
 
 def _audio_rows(split_h5_path: Path) -> int:
-    """Return the number of rows in the ``audio`` dataset at ``split_h5_path``.
+    """Return the leading-axis length of the ``audio`` dataset at ``split_h5_path``.
 
     :param split_h5_path: Path to a ``{split}.h5`` virtual-dataset file.
-    :returns: Leading-axis length of the ``audio`` dataset.
-    :rtype: int
+    :returns: Row count for the ``audio`` dataset.
     """
     with h5py.File(split_h5_path, "r") as f:
         dataset = cast(h5py.Dataset, f["audio"])
         return int(dataset.shape[0])
 
 
+def _assert_no_outputs(dataset_root: Path) -> None:
+    """Assert no ``{train,val,test}.h5`` and no ``.tmp-*.h5`` remain in ``dataset_root``.
+
+    :param dataset_root: Directory under inspection.
+    """
+    for split in ("train", "val", "test"):
+        assert not (dataset_root / f"{split}.h5").exists(), f"{split}.h5 lingered"
+        assert not (dataset_root / f".tmp-{split}.h5").exists(), f".tmp-{split}.h5 lingered"
+
+
 @pytest.fixture()
 def runner() -> CliRunner:
-    """Return a fresh ``click.testing.CliRunner`` for each test.
+    """Yield a fresh ``CliRunner`` per test so output buffers don't leak.
 
-    :returns: A new ``CliRunner`` instance.
-    :rtype: CliRunner
+    :returns: A new ``click.testing.CliRunner`` instance.
     """
     return CliRunner()
 
@@ -149,19 +158,29 @@ class TestReshardSpecDriven:
     ) -> None:
         """Three splits are sized by ``train_val_test_sizes // samples_per_shard``.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        Also pins that every split file exposes the three expected datasets
+        with ``np.float32`` dtype.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
         _materialize_dataset(tmp_path, spec)
 
-        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code == 0, result.output
-        assert _audio_rows(tmp_path / "train.h5") == 20
-        assert _audio_rows(tmp_path / "val.h5") == 10
-        assert _audio_rows(tmp_path / "test.h5") == 10
+        for split, expected_rows in [("train", 20), ("val", 10), ("test", 10)]:
+            with h5py.File(tmp_path / f"{split}.h5", "r") as f:
+                assert {"audio", "mel_spec", "param_array"} <= set(f.keys())
+                for key in ("audio", "mel_spec", "param_array"):
+                    dataset = cast(h5py.Dataset, f[key])
+                    assert dataset.dtype == np.float32, f"{split}/{key}: {dataset.dtype}"
+                    assert dataset.shape[0] == expected_rows
+        # Happy path leaves no staging artifacts behind.
+        for split in ("train", "val", "test"):
+            assert not (tmp_path / f".tmp-{split}.h5").exists()
 
     def test_zero_sized_split_is_skipped(
         self,
@@ -169,21 +188,51 @@ class TestReshardSpecDriven:
         patch_runtime_io: None,
         runner: CliRunner,
     ) -> None:
-        """A split with sample count 0 produces no output file.
+        """A split with sample count 0 produces no output file; siblings still get their rows.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 0, 10, samples_per_shard=10))
         _materialize_dataset(tmp_path, spec)
 
-        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code == 0, result.output
-        assert (tmp_path / "train.h5").exists()
+        assert _audio_rows(tmp_path / "train.h5") == 20
         assert not (tmp_path / "val.h5").exists()
-        assert (tmp_path / "test.h5").exists()
+        assert _audio_rows(tmp_path / "test.h5") == 10
+
+    def test_zero_sized_split_unlinks_stale_outputs(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+    ) -> None:
+        """A previously-populated split that is now zero-sized has stale outputs removed.
+
+        Re-running reshard after shrinking a split to zero in the spec must
+        not leave the old ``{split}.h5`` (or a stale ``.tmp-{split}.h5`` from
+        a prior failed run) behind — the dataset_root must always reflect
+        the spec's current split sizes.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 0, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        stale_val = tmp_path / "val.h5"
+        stale_staging = tmp_path / ".tmp-val.h5"
+        stale_val.write_bytes(b"stale")
+        stale_staging.write_bytes(b"stale")
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert not stale_val.exists()
+        assert not stale_staging.exists()
 
 
 class TestReshardSpecShardsAreAuthoritative:
@@ -195,20 +244,23 @@ class TestReshardSpecShardsAreAuthoritative:
         patch_runtime_io: None,
         runner: CliRunner,
     ) -> None:
-        """A spec.shards filename missing on disk exits non-zero, even with a stale neighbor.
+        """A missing ``spec.shards`` filename fails preflight with the path named in output.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
         _materialize_dataset(tmp_path, spec)
-        (tmp_path / spec.shards[0].filename).unlink()
+        missing_name = spec.shards[0].filename
+        (tmp_path / missing_name).unlink()
         (tmp_path / "shard-999999.h5").touch()
 
-        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code != 0
+        assert missing_name in result.output
+        _assert_no_outputs(tmp_path)
 
 
 class TestReshardSpecPath:
@@ -222,9 +274,9 @@ class TestReshardSpecPath:
     ) -> None:
         """``--spec`` accepts an arbitrary path outside the dataset root.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
         dataset_root = tmp_path / "data"
@@ -236,6 +288,7 @@ class TestReshardSpecPath:
         result = runner.invoke(
             _reshard_module.main,
             [str(dataset_root), "--spec", str(external_spec)],
+            catch_exceptions=False,
         )
 
         assert result.exit_code == 0, result.output
@@ -249,24 +302,26 @@ class TestReshardSpecPath:
     ) -> None:
         """A dataset root without ``input_spec.json`` exits with a user-oriented message.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         tmp_path.mkdir(exist_ok=True)
 
-        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code != 0
-        # ClickException surfaces a clean ``Error: ...`` message, not a raw traceback.
         assert "DatasetSpec not found" in result.output
-        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert INPUT_SPEC_FILENAME in result.output
 
 
 class TestReshardRemovedFlagsRejected:
-    """Flags that used to exist on reshard (``--train-samples`` / ``--val-samples`` / ``--test-
-    samples`` from the original CLI; ``--shard-size`` from the interim parent #1092) must be
-    rejected — the spec is now the single source of truth."""
+    """Reshard rejects ``--train-samples``, ``--val-samples``, ``--test-samples``, ``--shard-
+    size``.
+
+    Regression net against re-adding any of the legacy/interim flags — the spec is the single
+    source of truth and no override knob is allowed.
+    """
 
     @pytest.mark.parametrize(
         "flag",
@@ -279,53 +334,56 @@ class TestReshardRemovedFlagsRejected:
         runner: CliRunner,
         flag: str,
     ) -> None:
-        """Passing a removed flag fails with click's no-such-option error.
+        """Click's unknown-option handling returns its canonical exit code.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
-        :param flag: Parametrized removed flag name under test.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param flag: Removed flag name under test.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
         _materialize_dataset(tmp_path, spec)
 
         result = runner.invoke(_reshard_module.main, [str(tmp_path), flag, "1"])
 
-        assert result.exit_code != 0
-        assert "no such option" in result.output.lower()
+        assert result.exit_code == 2  # click's UsageError exit code
 
 
 class TestReshardSplitDivisibility:
-    """``train_val_test_sizes`` must be perfectly divisible by ``samples_per_shard``."""
+    """Non-divisible ``train_val_test_sizes`` surfaces as a clean ClickException."""
 
-    def test_non_divisible_split_size_raises_at_runtime(
+    @pytest.mark.parametrize("index", [0, 1, 2])
+    def test_stale_json_with_non_divisible_size_is_rejected(
         self,
         tmp_path: Path,
+        patch_runtime_io: None,
         runner: CliRunner,
+        index: int,
     ) -> None:
-        """A stale spec whose split size has a non-zero remainder is rejected loudly.
+        """A tampered split size at any index is rejected by the load-path wrapper.
 
-        Normally ``DatasetSpec._split_sizes_must_be_multiples_of_samples_per_shard``
-        catches this at parse time; this test bypasses model validation (via
-        ``SimpleNamespace``) to exercise the defensive guard inside ``main()``,
-        protecting against a stale R2 spec that predates the model validator.
+        ``DatasetSpec._split_sizes_must_be_multiples_of_samples_per_shard``
+        raises ``ValidationError`` on parse; the CLI converts that to a
+        ``click.ClickException`` so operators see a clean error message
+        instead of a raw pydantic traceback.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param index: ``train_val_test_sizes`` position to corrupt.
         """
-        tmp_path.mkdir(exist_ok=True)
-        bad_spec = SimpleNamespace(
-            output_format="hdf5",
-            render=SimpleNamespace(samples_per_shard=10),
-            train_val_test_sizes=(15, 10, 10),  # 15 % 10 != 0
-            shards=(),
-        )
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        spec_path = tmp_path / INPUT_SPEC_FILENAME
+        tampered = json.loads(spec_path.read_text())
+        tampered["train_val_test_sizes"][index] = 25  # 25 % 10 != 0
+        spec_path.write_text(json.dumps(tampered))
 
-        with mock.patch.object(_reshard_module, "load_spec_from_uri", return_value=bad_spec):
-            result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code != 0
-        assert "divisible" in result.output.lower() or "samples_per_shard" in result.output
+        assert "is invalid" in result.output
+        assert "not a multiple" in result.output
 
 
 class TestReshardOutputFormatGuard:
@@ -334,64 +392,371 @@ class TestReshardOutputFormatGuard:
     def test_wds_output_format_rejected_with_clickexception(
         self,
         tmp_path: Path,
+        patch_runtime_io: None,
         runner: CliRunner,
     ) -> None:
-        """A WDS-format spec exits non-zero before any shard open attempt.
+        """A real WDS-format spec exits non-zero before any shard open attempt.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
+        spec_kwargs = _spec_kwargs(20, 10, 10, samples_per_shard=10)
+        spec_kwargs["output_format"] = "wds"
+        spec = DatasetSpec(**spec_kwargs)
         tmp_path.mkdir(exist_ok=True)
-        wds_spec = SimpleNamespace(
-            output_format="wds",
-            render=SimpleNamespace(samples_per_shard=10),
-            train_val_test_sizes=(20, 10, 10),
-            shards=(),
-        )
+        (tmp_path / INPUT_SPEC_FILENAME).write_text(spec.model_dump_json())
 
-        with mock.patch.object(_reshard_module, "load_spec_from_uri", return_value=wds_spec):
-            result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
         assert result.exit_code != 0
         assert "output_format" in result.output
         assert "hdf5" in result.output
+        _assert_no_outputs(tmp_path)
 
 
 class TestReshardR2SpecUri:
     """``--spec r2://...`` is loaded via ``load_spec_from_uri`` (no real R2 I/O)."""
 
-    def test_r2_spec_uri_is_loaded_via_load_spec_from_uri(
+    def test_r2_spec_uri_is_honored(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``--spec r2://...`` produces the same split files as a local spec.
+
+        The local fallback is deleted before invocation, so a success here
+        proves the URI argument was honored end-to-end.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param monkeypatch: Used to intercept the ``load_spec_from_uri`` import binding.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        (tmp_path / INPUT_SPEC_FILENAME).unlink()
+        monkeypatch.setattr(_reshard_module, "load_spec_from_uri", lambda _uri: spec)
+
+        result = runner.invoke(
+            _reshard_module.main,
+            [str(tmp_path), "--spec", "r2://intermediate-data/data/foo/input_spec.json"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "train.h5").exists()
+
+
+class TestReshardShardIdOrdering:
+    """Tampered specs with mis-ordered ``shards[i].shard_id`` are rejected."""
+
+    def test_out_of_order_shard_id_fails_loud(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``shards[0].shard_id != 0`` exits non-zero before any output write.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param monkeypatch: Used to swap ``spec.shards`` for a mis-ordered tuple.
+        """
+        from synth_setter.pipeline.schemas.spec import ShardSpec
+
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        reversed_shards = tuple(
+            ShardSpec(
+                shard_id=len(spec.shards) - 1 - i,
+                filename=shard.filename,
+                seed=shard.seed,
+            )
+            for i, shard in enumerate(spec.shards)
+        )
+
+        def fake_loader(_uri: str) -> DatasetSpec:
+            # ``shards`` is a ``@cached_property``; the cached value lives in the
+            # instance ``__dict__`` once accessed. Mutate that single entry
+            # in-place so other Pydantic-managed state stays untouched.
+            # ``cast`` because Pydantic's stubs type ``__dict__`` as
+            # ``MappingProxyType``; at runtime ``BaseModel.__dict__`` is a real dict.
+            cast("dict[str, Any]", spec.__dict__)["shards"] = reversed_shards
+            return spec
+
+        monkeypatch.setattr(_reshard_module, "load_spec_from_uri", fake_loader)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        assert "shard_id" in result.output
+        _assert_no_outputs(tmp_path)
+
+
+class TestReshardShardContractValidation:
+    """Per-shard structural validation catches drift before any output write."""
+
+    @pytest.mark.parametrize("missing_key", DATASET_FIELD_NAMES)
+    def test_missing_required_dataset_fails_loud(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+        missing_key: str,
+    ) -> None:
+        """Any of the three required datasets missing from a shard is rejected.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param missing_key: Dataset key the test omits from the corrupted shard.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        corrupted_path = tmp_path / spec.shards[0].filename
+        shape_map = {
+            "audio": (10, 2, 64),
+            "mel_spec": (10, 2, 8, 8),
+            "param_array": (10, 12),
+        }
+        with h5py.File(corrupted_path, "w") as f:
+            for key, shape in shape_map.items():
+                if key != missing_key:
+                    f.create_dataset(key, shape=shape, dtype=np.float32)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        assert missing_key in result.output
+        assert str(corrupted_path) in result.output
+        _assert_no_outputs(tmp_path)
+
+    def test_group_at_required_key_fails_loud(
         self,
         tmp_path: Path,
         patch_runtime_io: None,
         runner: CliRunner,
     ) -> None:
-        """``--spec r2://...`` delegates to ``load_spec_from_uri`` (mocked).
+        """A Group (not a Dataset) at a required key is rejected with the key name.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
         _materialize_dataset(tmp_path, spec)
-        # Remove the local fallback so the test fails if the URI isn't honored.
-        (tmp_path / INPUT_SPEC_FILENAME).unlink()
-        spec_uri = "r2://intermediate-data/data/foo/input_spec.json"
+        corrupted_path = tmp_path / spec.shards[0].filename
+        with h5py.File(corrupted_path, "w") as f:
+            f.create_group("audio")  # wrong h5py type at the required key
+            f.create_dataset("mel_spec", shape=(10, 2, 8, 8), dtype=np.float32)
+            f.create_dataset("param_array", shape=(10, 12), dtype=np.float32)
 
-        with mock.patch.object(_reshard_module, "load_spec_from_uri", return_value=spec) as loader:
-            result = runner.invoke(
-                _reshard_module.main,
-                [str(tmp_path), "--spec", spec_uri],
-                catch_exceptions=False,
-            )
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
 
-        assert result.exit_code == 0, result.output
-        loader.assert_called_once_with(spec_uri)
-        assert (tmp_path / "train.h5").exists()
+        assert result.exit_code != 0
+        assert "audio" in result.output
+        assert "Group" in result.output
+        _assert_no_outputs(tmp_path)
+
+    def test_wrong_dtype_fails_loud(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+    ) -> None:
+        """A shard whose dataset is not ``np.float32`` is rejected with observed dtype.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        corrupted_path = tmp_path / spec.shards[0].filename
+        with h5py.File(corrupted_path, "w") as f:
+            f.create_dataset("audio", shape=(10, 2, 64), dtype=np.float64)
+            f.create_dataset("mel_spec", shape=(10, 2, 8, 8), dtype=np.float32)
+            f.create_dataset("param_array", shape=(10, 12), dtype=np.float32)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        assert "audio" in result.output
+        assert "float64" in result.output  # observed
+        assert "float32" in result.output  # expected
+        _assert_no_outputs(tmp_path)
+
+    def test_wrong_row_count_fails_loud(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+    ) -> None:
+        """Shards with a wrong leading-axis length are rejected with both observed and expected.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        corrupted_path = tmp_path / spec.shards[0].filename
+        with h5py.File(corrupted_path, "w") as f:
+            # 7 rows instead of 10.
+            f.create_dataset("audio", shape=(7, 2, 64), dtype=np.float32)
+            f.create_dataset("mel_spec", shape=(7, 2, 8, 8), dtype=np.float32)
+            f.create_dataset("param_array", shape=(7, 12), dtype=np.float32)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        assert "7 rows" in result.output
+        assert "samples_per_shard" in result.output
+        _assert_no_outputs(tmp_path)
+
+    def test_inconsistent_trailing_shape_fails_loud(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+    ) -> None:
+        """Shards with different trailing shapes name the offending shard and key.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        corrupted_path = tmp_path / spec.shards[1].filename
+        with h5py.File(corrupted_path, "w") as f:
+            f.create_dataset("audio", shape=(10, 2, 32), dtype=np.float32)
+            f.create_dataset("mel_spec", shape=(10, 2, 8, 8), dtype=np.float32)
+            f.create_dataset("param_array", shape=(10, 12), dtype=np.float32)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        assert str(corrupted_path) in result.output
+        assert "audio" in result.output
+        _assert_no_outputs(tmp_path)
+
+
+class TestReshardAtomicWrite:
+    """A failure inside ``_write_split`` leaves zero artifacts under ``dataset_root``.
+
+    Reshard stages every split as ``.tmp-<split>.h5`` and renames into place
+    only after every staging write succeeds (across-splits atomicity).
+    """
+
+    def test_create_virtual_dataset_failure_cleans_all_staging_files(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A mid-write h5py failure leaves no ``.h5`` or ``.tmp-*.h5`` next to the inputs.
+
+        Forces ``h5py.File.create_virtual_dataset`` to raise once the ``val``
+        split is being staged. ``train`` will already have finished its
+        staging write; the rollback path must unlink ``.tmp-train.h5`` and
+        ``.tmp-val.h5`` (and never rename either) so no operator can mistake
+        a partial run for a complete one.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param monkeypatch: Used to intercept ``h5py.File.create_virtual_dataset``.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        original = h5py.File.create_virtual_dataset
+
+        def failing(self: h5py.File, name: str, layout: h5py.VirtualLayout) -> h5py.Dataset:
+            if Path(self.filename).name == ".tmp-val.h5":
+                raise RuntimeError("simulated h5py failure during val staging")
+            return original(self, name, layout)
+
+        monkeypatch.setattr(h5py.File, "create_virtual_dataset", failing)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+
+        assert result.exit_code != 0
+        assert "simulated h5py failure" in str(result.exception) or result.exception is not None
+        # Across-splits atomicity: train staged successfully but must NOT be renamed
+        # because val failed during staging.
+        _assert_no_outputs(tmp_path)
+
+    def test_preflight_failure_creates_no_staging_files(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+    ) -> None:
+        """A failed preflight never reaches the staging phase, so no ``.tmp-*.h5`` is opened.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        with h5py.File(tmp_path / spec.shards[2].filename, "w") as f:
+            f.create_dataset("audio", shape=(7, 2, 64), dtype=np.float32)
+            f.create_dataset("mel_spec", shape=(7, 2, 8, 8), dtype=np.float32)
+            f.create_dataset("param_array", shape=(7, 12), dtype=np.float32)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)], catch_exceptions=False)
+
+        assert result.exit_code != 0
+        _assert_no_outputs(tmp_path)
+
+    def test_rename_phase_failure_unlinks_previously_renamed_splits(
+        self,
+        tmp_path: Path,
+        patch_runtime_io: None,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A mid-rename failure must also unlink any final outputs already in place.
+
+        Every staging write succeeds, then the rename loop fails on
+        ``.tmp-val.h5`` after ``.tmp-train.h5`` has already been renamed to
+        ``train.h5``. The cleanup must remove that already-landed ``train.h5``
+        too, otherwise the across-splits atomicity guarantee is a lie.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
+        :param monkeypatch: Used to wrap ``Path.replace`` to fail on the second call.
+        """
+        spec = DatasetSpec(**_spec_kwargs(20, 10, 10, samples_per_shard=10))
+        _materialize_dataset(tmp_path, spec)
+        original_replace = Path.replace
+
+        def failing_replace(self: Path, target: Path) -> Path:
+            if self.name == ".tmp-val.h5":
+                raise OSError("simulated rename failure on val")
+            return original_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", failing_replace)
+
+        result = runner.invoke(_reshard_module.main, [str(tmp_path)])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, OSError)
+        # train.h5 was renamed before val failed; cleanup must roll it back.
+        _assert_no_outputs(tmp_path)
 
 
 class TestReshardVirtualDatasetIdentity:
-    """Virtual-dataset rows actually surface the right source-shard bytes, in spec order."""
+    """Virtual-dataset rows surface the right source-shard bytes, in spec order."""
 
     def test_split_files_concatenate_source_shards_in_spec_order(
         self,
@@ -399,17 +764,22 @@ class TestReshardVirtualDatasetIdentity:
         patch_runtime_io: None,
         runner: CliRunner,
     ) -> None:
-        """Each split's audio[i*sps:(i+1)*sps] equals the i-th source shard's bytes.
+        """Each split's row ``i*sps:(i+1)*sps`` equals the i-th source shard's bytes.
 
-        :param tmp_path: Pytest tmp_path fixture for the dataset root.
-        :param patch_runtime_io: Spec runtime-factory stub fixture.
-        :param runner: Click test runner fixture.
+        Pins identity for all three datasets (``audio``, ``mel_spec``,
+        ``param_array``) so a swap-bug in the per-dataset loop can't slip
+        past. Also confirms outputs are real ``VirtualDataset`` files, not
+        materialized copies.
+
+        :param tmp_path: Per-test dataset root.
+        :param patch_runtime_io: Deterministic spec runtime stubs.
+        :param runner: Click test runner.
         """
         sps = 3
-        spec = DatasetSpec(**_spec_kwargs(sps * 2, sps * 1, sps * 1, samples_per_shard=sps))
+        spec = DatasetSpec(**_spec_kwargs(sps * 2, sps, sps, samples_per_shard=sps))
         tmp_path.mkdir(exist_ok=True)
         (tmp_path / INPUT_SPEC_FILENAME).write_text(spec.model_dump_json())
-        # Write shard `i` filled with `float(i + 1)` so each source's bytes are traceable.
+        # Each shard filled with float(i+1) so virtual-dataset slices stay traceable.
         for i, shard in enumerate(spec.shards):
             fill = float(i + 1)
             with h5py.File(tmp_path / shard.filename, "w") as f:
@@ -421,17 +791,35 @@ class TestReshardVirtualDatasetIdentity:
         assert result.exit_code == 0, result.output
 
         with h5py.File(tmp_path / "train.h5", "r") as f:
-            audio = cast(h5py.Dataset, f["audio"])[:]
-            params = cast(h5py.Dataset, f["param_array"])[:]
-        np.testing.assert_array_equal(audio[:sps], np.full((sps, 2, 64), 1.0, dtype=np.float32))
-        np.testing.assert_array_equal(audio[sps:], np.full((sps, 2, 64), 2.0, dtype=np.float32))
-        np.testing.assert_array_equal(params[:sps], np.full((sps, 12), 1.0, dtype=np.float32))
-        np.testing.assert_array_equal(params[sps:], np.full((sps, 12), 2.0, dtype=np.float32))
+            audio = cast(h5py.Dataset, f["audio"])
+            mel = cast(h5py.Dataset, f["mel_spec"])
+            param = cast(h5py.Dataset, f["param_array"])
+            assert audio.is_virtual
+            assert mel.is_virtual
+            assert param.is_virtual
+            np.testing.assert_array_equal(
+                audio[:sps], np.full((sps, 2, 64), 1.0, dtype=np.float32)
+            )
+            np.testing.assert_array_equal(
+                audio[sps:], np.full((sps, 2, 64), 2.0, dtype=np.float32)
+            )
+            np.testing.assert_array_equal(
+                mel[:sps], np.full((sps, 2, 8, 8), 1.0, dtype=np.float32)
+            )
+            np.testing.assert_array_equal(
+                mel[sps:], np.full((sps, 2, 8, 8), 2.0, dtype=np.float32)
+            )
+            np.testing.assert_array_equal(param[:sps], np.full((sps, 12), 1.0, dtype=np.float32))
+            np.testing.assert_array_equal(param[sps:], np.full((sps, 12), 2.0, dtype=np.float32))
 
         with h5py.File(tmp_path / "val.h5", "r") as f:
             np.testing.assert_array_equal(
                 cast(h5py.Dataset, f["audio"])[:],
                 np.full((sps, 2, 64), 3.0, dtype=np.float32),
+            )
+            np.testing.assert_array_equal(
+                cast(h5py.Dataset, f["mel_spec"])[:],
+                np.full((sps, 2, 8, 8), 3.0, dtype=np.float32),
             )
         with h5py.File(tmp_path / "test.h5", "r") as f:
             np.testing.assert_array_equal(
