@@ -1,6 +1,97 @@
 # CHANGELOG
 
 
+## v8.3.0 (2026-05-20)
+
+### Features
+
+- **pipeline**: Synth-setter-finalize-dataset entrypoint + wds branch
+  ([#1186](https://github.com/tinaudio/synth-setter/pull/1186),
+  [`1e4bd94`](https://github.com/tinaudio/synth-setter/commit/1e4bd94139760fe3245323b8a9852c1a6d89b27d))
+
+* feat(pipeline): synth-setter-finalize-dataset entrypoint + wds branch
+
+Wires the post-generate finalize stage as a console script that mirrors generate-dataset's
+  operator-side shape (programmatic Hydra compose, single DatasetSpec input). Phase 1 ships the wds
+  branch end-to-end; the hdf5 branch is a NotImplementedError stub (Phase 2).
+
+Surface additions reused by Phase 2 / Phase 3:
+
+- ``Split = Literal["train","val","test"]`` alias colocated with ``_SPLIT_LABELS`` in ``spec.py``. -
+  ``DatasetSpec.split_shard_ranges`` cached property returning ``{split: (lo, hi)}`` half-open
+  ranges derived from ``train_val_test_sizes // render.samples_per_shard``. -
+  ``R2Location.split_uri`` split into ``split_h5_uri(split: Split)`` and
+  ``split_wds_brace_uri(shard_range)``; the wds variant returns the ``r2://.../shard-{LO..HI}.tar``
+  brace pattern a webdataset reader ingests natively. - ``r2_io.upload(source, destination_uri)``
+  source-tolerant helper — delegates to ``upload_to_uri`` for local paths and runs ``rclone copyto``
+  between two ``r2:`` paths for R2-to-R2 copies. - ``r2_io.is_r2_reachable()`` promotes the
+  auth-probe pattern previously duplicated in ``test_local_launcher_roundtrip._r2_reachable``
+  (refactored to use the new helper) so test-side R2 gating has one source of truth.
+
+The wds finalize body downloads only the train-split shards (via
+  ``spec.split_shard_ranges["train"]``), runs ``get_stats_wds`` over them, uploads ``stats.npz`` to
+  ``spec.r2.stats_uri()``, then writes the ``dataset.complete`` marker strictly last per
+  ``pipeline/CLAUDE.md`` invariants.
+
+Tests:
+
+- Unit: ``tests/pipeline/test_entrypoints/test_finalize_dataset.py`` runs ``main()`` against the
+  real ``smoke-shard-wds`` experiment with rclone stubbed, asserts upload order is ``stats.npz`` →
+  ``dataset.complete``, and pins the hdf5 stub's NotImplementedError. - Integration:
+  ``tests/integration/test_finalize_dataset_r2.py`` (``integration_r2`` marker) stages a tiny wds
+  shard on the configured ``r2:`` remote and exercises the full finalize body end-to-end; skips via
+  ``r2_io.is_r2_reachable`` when creds are absent. - Schema: split_h5_uri / split_wds_brace_uri /
+  split_shard_ranges all covered in ``test_r2_location`` / ``test_dataset_spec``.
+
+Closes #1182
+
+* fixup: address repo-review BLOCK + high-signal WARN findings
+
+- finalize_dataset.main(): skip body when dataset.complete already exists at the run prefix
+  (idempotency gate; ``r2_io.object_size`` probe). - finalize_wds: stream per-shard download → fold
+  → unlink via the new ``stats.stream_stats_wds(Iterable[Path])`` helper; peak local disk stays at
+  one shard regardless of split size. - stats.py: extract ``_fold_shard_into_welford`` +
+  ``stream_stats_wds``; ``get_stats_wds`` now delegates so the directory + streaming entry points
+  share one implementation. - r2_io.upload: reject ``Path("r2://...")`` (and the collapsed ``r2:/``
+  form) with TypeError so source-type dispatch is unambiguous. - r2_io.is_r2_reachable: shutil
+  hoisted to the module imports. - R2Location.split_wds_brace_uri: raise ValueError when ``lo ==
+  hi`` instead of silently emitting a malformed ``shard-{000003..000002}.tar`` brace. - Magic
+  filenames (``dataset.complete``, ``stats.npz``) hoisted to ``pipeline/constants.py``;
+  ``R2Location`` + ``finalize_dataset`` import from the one source of truth. - finalize_dataset
+  docstrings: drop "Phase 2" / "this slice" narration per comment-hygiene C5/C11; describe current
+  behavior only. - Tests: - Tightened upload-destination assertions to compare against full
+  ``spec.r2.stats_uri()`` / ``dataset_complete_marker_uri()`` (BLOCK #3). - Added direct unit tests
+  for ``is_r2_reachable`` covering rclone-on-PATH + success, rclone-on-PATH + failure, rclone
+  missing from PATH (BLOCK #4). - Added multi-shard finalize_wds test asserting every shard URI is
+  downloaded, plus a peak-disk-invariant test that asserts at most one shard sits in work_dir at a
+  time. - Added Path-rejection test for r2_io.upload. - Added empty-range test for
+  split_wds_brace_uri. - Integration test now downloads stats.npz back and validates the ``{mean,
+  std}`` schema + asserts the marker is zero-byte. - Idempotency test confirms a second invocation
+  against a finalized prefix does zero work.
+
+* test(ci): extend validate_spec valid-spec fixture with split_shard_ranges
+
+PR #1186's new ``DatasetSpec.split_shard_ranges`` computed_field is included in
+  ``_REQUIRED_TOP_LEVEL_FIELDS`` by ``validate_spec.py`` (auto-derived from
+  ``DatasetSpec.model_computed_fields``), so the existing ``_make_valid_spec`` fixture is now
+  structurally invalid until it carries the split-range dict.
+
+* fixup: address PR #1186 Copilot review (3 inline comments)
+
+- r2_io.is_r2_reachable: require all three ``_SECRET_R2_ENV_KEYS`` in ``os.environ`` before the
+  rclone probe so the predicate matches ``ensure_r2_env_loaded``'s contract; otherwise a test gating
+  on ``is_r2_reachable`` could pass the gate via a user's local rclone config and then hit
+  ``RuntimeError`` from the env-key check downstream (Copilot #3271348167). -
+  finalize_dataset.finalize_wds: raise ``ValueError`` early when the train split is empty
+  (``split_shard_ranges["train"]`` has lo == hi) instead of surfacing a misleading
+  ``FileNotFoundError("stream_stats_wds received no shard paths")`` (Copilot #3271348204). -
+  finalize_dataset.finalize_wds docstring: clarify that the brace-URI helper applies only to
+  non-empty splits and callers must check ``lo < hi`` first (Copilot #3271348211). - Tests: extend
+  the two existing ``is_r2_reachable`` tests to set the three secret env keys (so the new
+  precondition path is exercised), add a ``test_returns_false_when_secret_env_keys_missing``
+  regression guard, and add ``test_finalize_wds_raises_on_empty_train_split``.
+
+
 ## v8.2.0 (2026-05-20)
 
 ### Features
