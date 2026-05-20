@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -903,6 +904,180 @@ class TestRun:
             run(spec)
 
         patched_subprocess.assert_not_called()
+
+    def test_render_retries_transient_failure_when_max_retries_set(
+        self,
+        fake_r2_remote: Path,
+        tmp_path: Path,
+    ) -> None:
+        """``max_retries=1`` + flaky renderer (1 fail, then success) → shard lands in R2.
+
+        The renderer-subprocess retry loop covers transient X11 / Xvfb init races
+        and pedalboard load hiccups on first call into a fresh subprocess. Rclone
+        sits outside the loop (rclone has its own --retries=3); only the renderer
+        call is wrapped.
+
+        :param fake_r2_remote: Local-typed R2 remote — asserted to contain the
+            shard after the retried render succeeds.
+        :param tmp_path: Pytest tmp dir used by ``_base_spec_kwargs``.
+        """
+        kwargs = _base_spec_kwargs(tmp_path)
+        kwargs["render"] = {**kwargs["render"], "max_retries": 1}  # type: ignore[dict-item]
+        spec = DatasetSpec(**kwargs)  # type: ignore[arg-type]
+        renderer_calls = 0
+
+        def _flaky_dispatcher(args: list[str]) -> int:
+            nonlocal renderer_calls
+            if args and args[0] == "rclone":
+                return _REAL_CHECK_CALL(args)
+            renderer_calls += 1
+            if renderer_calls == 1:
+                raise subprocess.CalledProcessError(1, "generate_vst_dataset.py")
+            return _materialize_shard(args)
+
+        with patch(
+            "synth_setter.cli.generate_dataset.subprocess.check_call",
+            side_effect=_flaky_dispatcher,
+        ):
+            run(spec)
+
+        assert renderer_calls == 2
+        landed = fake_r2_remote / spec.r2.bucket / spec.r2.prefix / spec.shards[0].filename
+        assert landed.is_file()
+
+    def test_parallel_render_uses_thread_pool_and_uploads_all_shards(
+        self,
+        fake_r2_remote: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``render.parallel=True`` + 4 shards → ≥2 worker threads; every shard uploads.
+
+        Pins ``available_cpus`` to 8 so the dispatch heuristic
+        ``min(max(1, available_cpus() // 2), len(my_range))`` resolves to 4
+        workers regardless of CI runner CPU count. The dispatcher stub blocks
+        each render until the second thread enters, forcing the pool to
+        actually parallelize.
+
+        :param fake_r2_remote: Local-typed R2 remote — asserted to contain
+            every shard after the parallel dispatch.
+        :param tmp_path: Pytest tmp dir used by ``_base_spec_kwargs``.
+        :param monkeypatch: Pins ``available_cpus`` so pool size is deterministic.
+        """
+        monkeypatch.setattr("synth_setter.cli.generate_dataset.available_cpus", lambda: 8)
+        kwargs = _base_spec_kwargs(tmp_path, train_val_test_sizes=[40000, 0, 0])
+        kwargs["render"] = {**kwargs["render"], "parallel": True}  # type: ignore[dict-item]
+        spec = DatasetSpec(**kwargs)  # type: ignore[arg-type]
+        assert len(spec.shards) == 4
+        thread_ids: set[int] = set()
+        lock = threading.Lock()
+        two_threads_seen = threading.Event()
+
+        def _thread_recording_dispatcher(args: list[str]) -> int:
+            if args and args[0] == "rclone":
+                return _REAL_CHECK_CALL(args)
+            with lock:
+                thread_ids.add(threading.get_ident())
+                if len(thread_ids) >= 2:
+                    two_threads_seen.set()
+            two_threads_seen.wait(timeout=5.0)
+            return _materialize_shard(args)
+
+        with patch(
+            "synth_setter.cli.generate_dataset.subprocess.check_call",
+            side_effect=_thread_recording_dispatcher,
+        ):
+            run(spec)
+
+        assert len(thread_ids) >= 2
+        bucket_prefix = fake_r2_remote / spec.r2.bucket / spec.r2.prefix
+        for shard in spec.shards:
+            assert (bucket_prefix / shard.filename).is_file()
+
+    def test_parallel_render_propagates_subprocess_failure(
+        self,
+        fake_r2_remote: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One failing render in a parallel pool → CalledProcessError surfaces fail-fast.
+
+        Pins ``available_cpus`` to 4 so pool size resolves to 2 workers. The
+        first thread to enter fails; the in-flight peer can complete, but
+        the remaining two futures get ``cancel_futures=True``-aborted before
+        they start. Net effect: renderer fires at most twice (1 fail + ≤1
+        in-flight peer), and at most one shard lands in R2.
+
+        :param fake_r2_remote: Local-typed R2 remote — used for state-based
+            cancellation check.
+        :param tmp_path: Pytest tmp dir used by ``_base_spec_kwargs``.
+        :param monkeypatch: Pins ``available_cpus`` so pool size is deterministic.
+        """
+        monkeypatch.setattr("synth_setter.cli.generate_dataset.available_cpus", lambda: 4)
+        kwargs = _base_spec_kwargs(tmp_path, train_val_test_sizes=[40000, 0, 0])
+        kwargs["render"] = {**kwargs["render"], "parallel": True}  # type: ignore[dict-item]
+        spec = DatasetSpec(**kwargs)  # type: ignore[arg-type]
+        renderer_call_count = 0
+        lock = threading.Lock()
+
+        def _one_failing(args: list[str]) -> int:
+            nonlocal renderer_call_count
+            if args and args[0] == "rclone":
+                return _REAL_CHECK_CALL(args)
+            with lock:
+                renderer_call_count += 1
+                this_attempt = renderer_call_count
+            if this_attempt == 1:
+                raise subprocess.CalledProcessError(1, "generate_vst_dataset.py")
+            return _materialize_shard(args)
+
+        with patch(
+            "synth_setter.cli.generate_dataset.subprocess.check_call",
+            side_effect=_one_failing,
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                run(spec)
+
+        bucket_prefix = fake_r2_remote / spec.r2.bucket / spec.r2.prefix
+        landed = sum(1 for shard in spec.shards if (bucket_prefix / shard.filename).is_file())
+        assert landed <= 1
+        assert renderer_call_count <= 2
+
+    def test_render_raises_after_exhausting_max_retries(
+        self,
+        fake_r2_remote: Path,
+        tmp_path: Path,
+    ) -> None:
+        """``max_retries=2`` + always-failing renderer → 3 attempts then propagate.
+
+        Confirms the retry budget is bounded: ``max_retries + 1`` total attempts,
+        then ``CalledProcessError`` surfaces and no shard is uploaded.
+
+        :param fake_r2_remote: Local-typed R2 remote — asserted empty since
+            every render attempt failed.
+        :param tmp_path: Pytest tmp dir used by ``_base_spec_kwargs``.
+        """
+        kwargs = _base_spec_kwargs(tmp_path)
+        kwargs["render"] = {**kwargs["render"], "max_retries": 2}  # type: ignore[dict-item]
+        spec = DatasetSpec(**kwargs)  # type: ignore[arg-type]
+        renderer_calls = 0
+
+        def _always_fails(args: list[str]) -> int:
+            nonlocal renderer_calls
+            if args and args[0] == "rclone":
+                return _REAL_CHECK_CALL(args)
+            renderer_calls += 1
+            raise subprocess.CalledProcessError(1, "generate_vst_dataset.py")
+
+        with patch(
+            "synth_setter.cli.generate_dataset.subprocess.check_call",
+            side_effect=_always_fails,
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                run(spec)
+
+        assert renderer_calls == 3
+        assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from synth_setter.data.vst.core import extract_renderer_version  # noqa: E402
 from synth_setter.pipeline import r2_io  # noqa: E402
 from synth_setter.pipeline.partitioning import (  # noqa: E402
+    available_cpus,
     get_my_shards,
     read_rank_world_from_env,
 )
@@ -169,24 +171,129 @@ def run(spec: DatasetSpec) -> None:
     with tempfile.TemporaryDirectory() as work_dir_str:
         work_dir = Path(work_dir_str)
 
-        rendered = 0
-        skipped = 0
-        for shard_id in my_range:
-            shard = spec.shards[shard_id]
-            shard_object_uri = spec.r2.shard_uri(shard)
-            existing_size = r2_io.object_size(shard_object_uri)
-            if existing_size is not None and existing_size > 0:
-                logger.info(
-                    f"skipping shard {shard.shard_id} — already in R2 "
-                    f"({existing_size} bytes): {shard.filename}"
-                )
-                skipped += 1
-                continue
-            _render_and_upload_shard(spec, shard, work_dir, r2_dest_prefix)
-            rendered += 1
+        if spec.render.parallel and len(my_range) > 0:
+            rendered, skipped = _dispatch_shards_parallel(spec, my_range, work_dir, r2_dest_prefix)
+        else:
+            rendered, skipped = _dispatch_shards_serial(spec, my_range, work_dir, r2_dest_prefix)
         logger.info(
             f"shard summary: rendered={rendered} skipped={skipped} of {len(my_range)} assigned"
         )
+
+
+def _dispatch_shards_serial(
+    spec: DatasetSpec,
+    my_range: range,
+    work_dir: Path,
+    r2_dest_prefix: str,
+) -> tuple[int, int]:
+    """Render+upload owned shards in order; fail-fast on first error.
+
+    :param spec: Validated dataset spec.
+    :param my_range: Contiguous range of shard IDs owned by this rank.
+    :param work_dir: Per-run tempdir owned by ``run()``.
+    :param r2_dest_prefix: ``spec.r2.rclone_prefix()``.
+    :returns: ``(rendered, skipped)`` summary counts over ``my_range``.
+    """
+    rendered = 0
+    skipped = 0
+    for shard_id in my_range:
+        r, s = _render_one_owned_shard(spec, shard_id, work_dir, r2_dest_prefix)
+        rendered += int(r)
+        skipped += int(s)
+    return rendered, skipped
+
+
+def _dispatch_shards_parallel(
+    spec: DatasetSpec,
+    my_range: range,
+    work_dir: Path,
+    r2_dest_prefix: str,
+) -> tuple[int, int]:
+    """Render+upload owned shards concurrently via a ``ThreadPoolExecutor``.
+
+    Pool size is ``min(max(1, available_cpus() // 2), len(my_range))``. The
+    heuristic halves the CPU count to leave headroom for each renderer
+    subprocess's own intra-process threading (pedalboard / librosa / BLAS).
+
+    Producer/consumer dispatch: at most ``workers`` shards are submitted at
+    any time, and a new shard is submitted only after every completion in
+    the current batch has been observed without error. The first worker
+    exception is re-raised by ``fut.result()`` and the loop exits without
+    submitting more work; ``shutdown(cancel_futures=True)`` then aborts
+    any not-yet-started shards while in-flight peers run to completion
+    (Python has no thread interruption) — matches the
+    no-interruption-mid-render reality of the serial path. Submitting in
+    waves rather than all shards up-front guarantees no shard beyond the
+    in-flight set can start once a failure surfaces, even if a worker
+    thread is freed before the main thread observes the exception.
+
+    :param spec: Validated dataset spec.
+    :param my_range: Non-empty contiguous range of shard IDs owned by this rank.
+    :param work_dir: Per-run tempdir owned by ``run()``; peak local disk
+        scales with the pool size (one in-flight shard per worker thread).
+    :param r2_dest_prefix: ``spec.r2.rclone_prefix()``.
+    :returns: ``(rendered, skipped)`` summary counts over ``my_range``.
+    """
+    workers = min(max(1, available_cpus() // 2), len(my_range))
+    logger.info(f"parallel dispatch: workers={workers} shards={len(my_range)}")
+    rendered = 0
+    skipped = 0
+    pending = iter(my_range)
+    in_flight: set[Future[tuple[bool, bool]]] = set()
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        for _ in range(workers):
+            sid = next(pending, None)
+            if sid is None:
+                break
+            in_flight.add(
+                pool.submit(_render_one_owned_shard, spec, sid, work_dir, r2_dest_prefix)
+            )
+        while in_flight:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                r, s = fut.result()
+                rendered += int(r)
+                skipped += int(s)
+            for _ in range(len(done)):
+                sid = next(pending, None)
+                if sid is None:
+                    break
+                in_flight.add(
+                    pool.submit(_render_one_owned_shard, spec, sid, work_dir, r2_dest_prefix)
+                )
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return rendered, skipped
+
+
+def _render_one_owned_shard(
+    spec: DatasetSpec,
+    shard_id: int,
+    work_dir: Path,
+    r2_dest_prefix: str,
+) -> tuple[bool, bool]:
+    """Render+upload one owned shard, or skip if R2 already has it.
+
+    Encapsulates the R2 skip-probe + ``_render_and_upload_shard`` invocation
+    so the serial and parallel dispatch arms share one callable.
+
+    :param spec: Validated dataset spec; ``spec.shards[shard_id]`` is fetched.
+    :param shard_id: Index into ``spec.shards``.
+    :param work_dir: Per-run tempdir owned by ``run()``.
+    :param r2_dest_prefix: ``spec.r2.rclone_prefix()``.
+    :returns: ``(rendered, skipped)`` — exactly one is ``True``.
+    """
+    shard = spec.shards[shard_id]
+    existing_size = r2_io.object_size(spec.r2.shard_uri(shard))
+    if existing_size is not None and existing_size > 0:
+        logger.info(
+            f"skipping shard {shard.shard_id} — already in R2 "
+            f"({existing_size} bytes): {shard.filename}"
+        )
+        return False, True
+    _render_and_upload_shard(spec, shard, work_dir, r2_dest_prefix)
+    return True, False
 
 
 def _render_and_upload_shard(
@@ -197,13 +304,32 @@ def _render_and_upload_shard(
 ) -> None:
     """Render a single shard, upload it to R2, then unlink the local file.
 
-    Unlinking after upload bounds local disk to one shard at a time — necessary on disk-constrained
-    workers running multi-shard partitions.
+    Unlinking after upload bounds local disk to one in-flight shard per caller — necessary on
+    disk-constrained workers running multi-shard partitions. Under ``render.parallel=True`` this
+    bound applies per worker thread, so peak local disk scales with the dispatcher's pool size
+    (see ``_dispatch_shards_parallel`` and ``RenderConfig.parallel``). The renderer subprocess is
+    wrapped in a retry loop bounded by ``spec.render.max_retries`` (default 0 = strict
+    fail-fast); rclone is outside the loop because it already retries via ``--retries=3``.
+
+    :raises subprocess.CalledProcessError: Renderer (or rclone) subprocess exited non-zero after
+        exhausting the retry budget.
+    :raises RuntimeError: Renderer exited 0 without writing the expected shard file.
     """
     args = [VST_HEADLESS_WRAPPER] if sys.platform == "linux" else []
     args += build_generate_args(spec, shard, work_dir)
     logger.info(f"rendering shard {shard.shard_id} -> {shard.filename}")
-    subprocess.check_call(args)  # noqa: S603 — args built from validated spec
+    max_attempts = spec.render.max_retries + 1
+    for attempt in range(max_attempts):
+        try:
+            subprocess.check_call(args)  # noqa: S603 — args built from validated spec
+            break
+        except subprocess.CalledProcessError:
+            if attempt + 1 == max_attempts:
+                raise
+            logger.warning(
+                f"shard {shard.shard_id} render failed on attempt "
+                f"{attempt + 1}/{max_attempts}; retrying"
+            )
     shard_path = work_dir / shard.filename
     # Surface a generator that exited 0 without writing output here, not as a
     # downstream rclone "source not found".
