@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import tarfile
 from pathlib import Path
 
@@ -23,60 +22,28 @@ import webdataset as wds
 
 from synth_setter.data.vst.writers import make_hdf5_dataset, make_wds_dataset
 from synth_setter.pipeline.schemas.shard_metadata import ShardMetadata
-from synth_setter.pipeline.schemas.spec import RenderConfig
 
 _ = hdf5plugin  # keep type checkers from flagging the side-effect import
 
-_PLUGIN_PATH = os.environ.get("SYNTH_SETTER_PLUGIN_PATH") or "plugins/Surge XT.vst3"
-_PRESET_PATH = "presets/surge-base.vstpreset"
-_SAMPLE_RATE = 44100
-_CHANNELS = 2
-_DURATION = 4.0
-_VELOCITY = 100
-_MIN_LOUDNESS = -55.0
-_SPEC_NAME = "surge_xt"
-_RENDERER_VERSION = "1.3.4"
+# Hardcoded loudness-passing patch, h5↔h5 phase-robust comparison helpers, and
+# the canonical ``_PLUGIN_PATH`` are reused verbatim from
+# ``test_generate_vst_dataset.py`` so this module's h5↔wds parity check uses
+# the same thresholds the h5↔h5 round-trip tests already pin, and the
+# ``skip_no_vst`` mark below tracks the same plugin path that ``_render_cfg``
+# embeds in the produced ``RenderConfig``.
+from tests.data.vst.test_generate_vst_dataset import (  # noqa: E402  pinned canonical patch
+    _HARDCODED_NOTE_PARAMS,
+    _HARDCODED_SYNTH_PARAMS,
+    _MEL_MEAN_ABS_MAX,
+    _PLUGIN_PATH,
+    _assert_audio_metrics_within_thresholds,
+    _render_cfg,
+)
 
 skip_no_vst = pytest.mark.skipif(
     not Path(_PLUGIN_PATH).exists(),
     reason=f"VST plugin not found at {_PLUGIN_PATH}",
 )
-
-# Hardcoded loudness-passing patch and h5↔h5 phase-robust comparison helpers
-# are reused verbatim from ``test_generate_vst_dataset.py`` so this module's
-# h5↔wds parity check uses the same thresholds the h5↔h5 round-trip tests
-# already pin. Imported (not copied) on purpose: a future spec change updates
-# the canonical patch in one place, and both test modules track it.
-from tests.data.vst.test_generate_vst_dataset import (
-    _HARDCODED_NOTE_PARAMS,
-    _HARDCODED_SYNTH_PARAMS,
-    _MEL_MEAN_ABS_MAX,
-    _assert_audio_metrics_within_thresholds,
-)
-
-
-def _render_cfg(num_samples: int, samples_per_render_batch: int | None = None) -> RenderConfig:
-    """Build a ``RenderConfig`` with this module's test defaults.
-
-    :param num_samples: Total samples to render per shard.
-    :param samples_per_render_batch: Per-batch sample count (defaults to ``num_samples``).
-    :return: A ``RenderConfig`` populated with the test-defaults.
-    """
-    return RenderConfig(
-        plugin_path=_PLUGIN_PATH,
-        preset_path=_PRESET_PATH,
-        param_spec_name=_SPEC_NAME,
-        renderer_version=_RENDERER_VERSION,
-        sample_rate=_SAMPLE_RATE,
-        channels=_CHANNELS,
-        velocity=_VELOCITY,
-        signal_duration_seconds=_DURATION,
-        min_loudness=_MIN_LOUDNESS,
-        samples_per_render_batch=samples_per_render_batch if samples_per_render_batch is not None else num_samples,
-        samples_per_shard=num_samples,
-        # Darwin-portable: never run the editor warm-up (#714).
-        gui_toggle_cadence="never",
-    )
 
 
 def _tar_members(tar_path: Path) -> dict[str, bytes]:
