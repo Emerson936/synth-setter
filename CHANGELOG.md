@@ -1,6 +1,307 @@
 # CHANGELOG
 
 
+## v8.0.0 (2026-05-20)
+
+### Chores
+
+- **pipeline**: Clean up h5 resharding ([#1179](https://github.com/tinaudio/synth-setter/pull/1179),
+  [`e9f12de`](https://github.com/tinaudio/synth-setter/commit/e9f12de0ec2123399fd068923a80b5511094ec16))
+
+* refactor(pipeline)!: address repo-review and Copilot findings on reshard CLI
+
+Follow-up to the merged spec-driven reshard (#1178). Addresses every fix-worthy finding from the
+  multi-skill repo review and the Copilot inline comments across PRs #1092 / #1093 / #1096 / #1178.
+  Declines were approved by the requester before this commit.
+
+Production code:
+
+* Move ``load_spec_from_uri`` from ``cli/generate_dataset.py`` to ``pipeline/spec_io.py`` —
+  importing reshard no longer drags the runner's Hydra / rootutils bootstrap into the import graph
+  (Copilot #1092 L20). * Add a real per-shard structural validation pass
+  (``_check_shard_contracts``): every shard must expose ``audio`` / ``mel_spec`` / ``param_array``
+  as ``np.float32`` ``Dataset``s with ``shape[0] == samples_per_shard`` and a tail consistent with
+  the first shard. Drift surfaces as a clean ``ClickException`` instead of a bare ``KeyError`` or a
+  silently-corrupt virtual dataset (ml-pipeline BLOCK, synth-setter BLOCK). * Add a preflight
+  existence sweep (``_check_shards_present``) that lists every missing canonical filename before any
+  output handle opens (ml-pipeline WARN; Copilot #1178 implicit). * Stage each split as
+  ``<dataset_root>/.tmp-<split>.h5`` and atomically ``os.replace`` into ``<split>.h5`` only after
+  ``create_virtual_dataset`` succeeds. A mid-loop failure on shard N can no longer leave a stale
+  ``train.h5`` next to the inputs (ml-pipeline WARN, ml-test verified on the previous PR). * Drop
+  the in-CLI divisibility backstop. ``DatasetSpec``'s parse-time validator already catches the same
+  condition; the load-path ``ValueError``-to-``ClickException`` shim surfaces a clean operator
+  message (synth-setter WARN, ml-pipeline WARN). * Rename loop variable ``files`` to ``split_paths``
+  (4 reviewers + Copilot L67/L70 across two PRs flagged the shadowing); rename ``file`` to
+  ``shard_path`` (python-style WARN); unpack ``train_n, val_n, test_n`` explicitly (code-health
+  WARN); rank-agnostic VirtualLayout slicing (ml-pipeline WARN). * Tighten module + ``_load_spec``
+  docstrings, drop historical narration about removed flags (comment-hygiene WARN).
+
+Tests:
+
+* Replace the ``SimpleNamespace`` divisibility/wds tests with real-JSON fixtures — the load path is
+  now what's tested (tdd-impl, ml-pipeline, ml-test WARNs). * Add a
+  ``TestReshardShardContractValidation`` class covering missing dataset keys, wrong dtype, wrong row
+  count, and inconsistent trailing shape (the new BLOCK fixes). * Add a ``TestReshardAtomicWrite``
+  class verifying no partial ``.h5`` or ``.tmp-*.h5`` artifacts remain after a mid-loop contract
+  failure. * Pin ``mel_spec`` identity (3-of-3 datasets, was 2-of-3) and assert ``is_virtual`` on
+  each output dataset (ml-test WARNs). * Assert the missing-shard filename appears in CLI output;
+  assert ``INPUT_SPEC_FILENAME`` in the missing-spec error (tdd-impl WARNs). * Use ``exit_code ==
+  2`` instead of click's English error string for the removed-flag tests (synth-setter WARN). * Drop
+  the ``loader.assert_called_once_with`` interaction assertion from the R2-URI test — state-based
+  proof remains via the unlinked local fallback (tdd-impl WARN). * Add the ``why`` comment for the
+  ``patch_runtime_io`` factory stubs; fix the docstring word-break in
+  ``TestReshardRemovedFlagsRejected``; tighten the "bytes are traceable" comment (comment-hygiene
+  WARNs).
+
+Declines (approved by requester):
+
+* Keep the ``--help`` rclone env-var note; keep ``click.echo`` over structlog (pipeline-wide
+  convention); skip ``--out-dir`` (atomic rename is the fix the bug needed); keep string-path
+  monkeypatching (pytest idiom); don't parametrize ``--spec`` with ``gs://`` (not a supported
+  scheme); skip audio ``[-1, 1]`` range assertion (validation belongs in worker tests, not the VDS
+  assembler).
+
+Refs #1091
+
+* refactor(pipeline): fix atomic-write coverage + tighten on second review pass
+
+Three of the seven repo-review agents independently flagged a real BLOCK in the prior commit:
+  ``TestReshardAtomicWrite`` was a no-op. The test drifted a shard's row count, which fires inside
+  ``_check_shard_contracts`` *before* ``_write_split`` is ever called — so the staging cleanup path
+  the test claims to verify had zero coverage.
+
+Production:
+
+* Redesign for across-splits atomicity: stage every non-empty split as ``.tmp-<split>.h5``, then
+  rename them all only after every staging write succeeds. A failure on shard N of any split unlinks
+  every staging file (no train.h5 ever lands when val fails). Per-split atomicity wasn't enough; if
+  train renamed and val failed, train.h5 was stranded (ml-pipeline WARN, multi-reviewer follow-up).
+  * Return per-dataset tails from ``_check_shard_contracts`` so ``_write_split`` doesn't reopen
+  shard 0 to recompute them (code-health DRY WARN flagged across reviewers). * Add
+  ``_check_shard_ids_match_spec_order`` so a tampered spec where ``shards[i].shard_id != i`` is
+  rejected before any work begins (ml-pipeline WARN — user override of my decline). * Module-level
+  constants: ``_SPLITS``, ``_STAGING_PREFIX``, ``_FLOAT32`` to remove magic strings/dtypes and keep
+  the staging convention grep-friendly (python-style, user override). * Use ``np.dtype("float32")``
+  for the dtype-equality check (python-style, user override). * Use ``Path.replace`` instead of
+  ``os.replace``; drop the ``import os`` (python-style WARN). * Drop redundant ``tuple(...)`` wrap
+  on already-tuple ``shape[1:]``. * ``noqa: DOC503`` on ``_stage_and_commit_splits`` since it
+  deliberately re-raises ``BaseException`` after cleanup; the docstring documents this.
+
+* Rewrite ``TestReshardAtomicWrite``: -
+  ``test_create_virtual_dataset_failure_cleans_all_staging_files`` monkeypatches
+  ``h5py.File.create_virtual_dataset`` to raise on the val staging file. Train has already finished
+  staging successfully; the test asserts neither ``train.h5`` (no rename happened) nor
+  ``.tmp-train.h5`` / ``.tmp-val.h5`` (rollback unlinked both) remain. This actually exercises the
+  staging/rename code path the previous test claimed to cover (BLOCK fix). -
+  ``test_preflight_failure_creates_no_staging_files`` keeps the preflight-rejection case under a
+  clear name. * Parametrize ``test_missing_required_dataset_fails_loud`` over all three required
+  keys (ml-test WARN). * Add ``test_group_at_required_key_fails_loud`` exercising the
+  ``isinstance(h5py.Dataset)`` defensive branch that had no coverage (ml-test/code-health WARN). *
+  Tighten error-string assertions: every contract-validation test now pins both the corrupted shard
+  path and the offending key (or expected+observed values for dtype/row count) rather than just an
+  expected-side substring (tdd-impl + ml-test WARNs). * Parametrize
+  ``test_stale_json_with_non_divisible_size_is_rejected`` over ``train_val_test_sizes`` indices
+  0/1/2 (ml-test WARN). * Add ``TestReshardShardIdOrdering::test_out_of_order_shard_id_fails_loud``
+  exercising the new ``_check_shard_ids_match_spec_order`` (user override). * Add happy-path
+  assertion that no ``.tmp-*.h5`` artifacts remain after a successful run (ml-pipeline WARN). *
+  ``catch_exceptions=False`` everywhere now, including failure paths — consistent behavior +
+  surfaces any non-ClickException leak (tdd-impl WARN). * Extract ``_assert_no_outputs`` helper so
+  every preflight/contract test pins the no-partial-outputs invariant uniformly. * Tighten comments
+  (``FIXED_NOW`` rationale, drop "Closed-PR regression net" comment whose content was already in the
+  class docstring, drop the inline review-justification on the exit-code-2 assertion).
+
+Declines approved by requester this round: lift ``_REQUIRED_DATASETS`` to schemas/ (scope creep),
+  per-K-shard progress logging (premature).
+
+* docs(doc-map): address doc-drift advisory for PR #1179
+
+Two findings flagged on the new HEAD:
+
+* ``src/synth_setter/pipeline/spec_io.py`` coverage now lists ``load_spec_from_uri`` in its exports
+  list, and a sentence explains the reshard-side rationale for keeping the wrapper here rather than
+  in ``cli/generate_dataset.py``. * ``configs/compute/runpod-template.yaml`` coverage no longer
+  claims ``WORKER_SPEC_URI`` is consumed by ``load_spec_from_uri`` in the worker. The worker
+  rebuilds the spec from pinned Hydra overrides; ``WORKER_SPEC_URI`` is
+  informational/CI-consumer-facing. Mirrors ``configs/compute/local-template.yaml``'s phrasing.
+
+* refactor(pipeline): also unlink renamed splits on rename failure
+
+Addresses Copilot review comments on PR #1179.
+
+Comment #3270872754: ``_stage_and_commit_splits`` claimed across-splits atomicity but only unlinked
+  staging files on failure. If ``Path.replace`` fails midway through the rename loop (after
+  ``train.h5`` is already in place), the earlier final outputs were left behind. Track renamed
+  finals in the try block and unlink them in the except handler too.
+
+Comment #3270872770: the ``:raises click.ClickException:`` clause was a lie — h5py and
+  ``Path.replace`` errors propagate raw, the function does not wrap them. Replace with a prose
+  paragraph that names the real exception sources.
+
+Comment #3270872783: ``test_out_of_order_shard_id_fails_loud`` replaced ``spec.__dict__`` wholesale
+  via ``object.__setattr__``, which is brittle against Pydantic-managed internals. Mutate only the
+  cached ``shards`` entry in-place — that is all the test needs.
+
+Adds ``test_rename_phase_failure_unlinks_previously_renamed_splits`` to pin the new cleanup
+  behaviour; the test fails on the previous code (``train.h5 lingered``) and passes after.
+
+* refactor(pipeline): move shard preflight checks to pipeline/ci/validate_shard
+
+Addresses ktinubu's review request on PR #1179 (PRR_kwDOPbKJR88AAAABAcby8Q): "All the _check* shard
+  methods should live in src/synth_setter/pipeline/ci/validate_shard.py".
+
+Moves the three trust-boundary preflight checks (``_check_shards_present``,
+  ``_check_shard_ids_match_spec_order``, ``_check_shard_contracts``) out of
+  ``pipeline/data/reshard.py`` and into ``pipeline/ci/validate_shard.py`` as public functions
+  (``check_shards_present``, ``check_shard_ids_match_spec_order``, ``check_shard_contracts``) — the
+  underscore prefix would be misleading once they cross module boundaries.
+
+Drops the parallel ``_REQUIRED_DATASETS`` constant in favor of ``DATASET_FIELD_NAMES`` from
+  ``synth_setter.data.vst.shapes``, which is already imported in ``validate_shard.py`` and is the
+  single source of truth for the writer's per-shard field names. Test parametrization follows.
+
+* fix(reshard): unlink stale outputs for now-empty splits
+
+Addresses Copilot review comment #3270933267 on PR #1179: ``_stage_and_commit_splits`` only acted on
+  non-empty splits. A re-run after shrinking a split to zero in the spec would leave the old
+  ``{split}.h5`` (or a stale ``.tmp-{split}.h5`` from a prior failed run) behind, so dataset_root no
+  longer matched the spec.
+
+Up front, for every split with an empty shard list, unlink both ``{name}.h5`` and ``.tmp-{name}.h5``
+  from dataset_root. Non-empty splits get clobbered by the rename phase already, so they need no
+  pre-cleanup.
+
+Pinned by ``test_zero_sized_split_unlinks_stale_outputs``: pre-populates ``val.h5`` and
+  ``.tmp-val.h5`` under a spec where val=0, then asserts both are gone after a successful run.
+
+### Continuous Integration
+
+- Pre-pr review gate validates a review file, not just a token
+  ([#1175](https://github.com/tinaudio/synth-setter/pull/1175),
+  [`387b6a5`](https://github.com/tinaudio/synth-setter/commit/387b6a53e08b7d2a15184ac03342265d1a4732e7))
+
+* feat(claude-hooks): pre-PR review gate validates a real review file, not just a token
+
+Replaces the honor-system REVIEW_FULL_DONE=1 token with REVIEW_FULL=<path>, where <path> must
+  resolve to a freshly-written /repo-review-full-no-comments report. The hook validates:
+
+- file exists and is non-empty - mtime >= HEAD's commit time (a review written before the latest
+  commit is rejected -- the part the old flag could not enforce) - starts with `#
+  repo-review-full-no-comments` (>=200 bytes to block trivial stubs) or a `PASS` line (the skill's
+  empty-findings short form)
+
+The gate stays honor-system -- a determined agent can still write a fake file -- but it raises the
+  floor from "type a token" to "produce review text newer than HEAD," forcing the agent to actually
+  save the rendered report somewhere a reviewer can audit.
+
+Updates 5 bash tests + 3 python tests to the new contract, plus the .claude/settings.json
+  description and the AGENTS.md Pre-PR review gate bullet.
+
+Refs #1072
+
+* refactor(claude-hooks): gate on filename-encoded SHA, not on file content shape
+
+Addresses Copilot finding on PR #1175 (line-anchored vs file-anchored grep) by rearchitecting the
+  gate so it does not sniff file contents at all.
+
+The review skill (/repo-review-full-no-comments Step 7) now writes the rendered report to a sentinel
+  file at:
+
+.agent-reviews/repo-review-full-no-comments.<HEAD-sha>.md
+
+Filename format owned by agent/_shared/review_sentinel.py, the single source of truth shared with
+  the gate hook (no copy-paste duplication). The hook validates the path supplied via
+  REVIEW_FULL=<path> by:
+
+1. Confirming the file exists and is >=200 bytes (touch-bypass guard). 2. Parsing the encoded SHA
+  via the shared Python helper. 3. Checking the SHA is an ancestor of HEAD (git merge-base
+  --is-ancestor). 4. Checking the lag is <=REVIEW_MAX_LAG (default 2) first-parent commits.
+  --first-parent means merging origin/main counts as 1 commit, not the dozens it brings in -- that
+  is the behavior we want.
+
+No regex on file contents; the entire "starts with X" / "PASS marker" machinery is gone, along with
+  the mtime arithmetic. Filename is the contract.
+
+Adds 9 new bash gate tests covering: small file (touch-bypass), non-sentinel filename, non-ancestor
+  SHA, HEAD-SHA passes, lag<=2 passes, lag=3 blocks, REVIEW_MAX_LAG override, --first-parent merge
+  counts as 1. Adds 25 new unit tests for the helper module (round-trip, SHA shape validation, CLI
+  surface used by the bash gate). Reworks 1 python test to use the new sentinel filename via the
+  helper.
+
+* chore(claude-hooks): address review-round findings on PR #1175
+
+Pre-pr-review-gate hardening from Copilot + /repo-review-full passes:
+
+- Validate REVIEW_MAX_LAG as a non-negative integer (was: `[[ -gt ]]` crashed under set -e on
+  non-numeric input, exiting without a BLOCKED message). - Replace `wc -c` with `stat -c %s` for the
+  size guard (O(1) metadata read; portable across coreutils variants). - Add explicit SENTINEL_PY
+  existence check and distinguish helper exit-2 (internal error) from exit-1 (filename doesn't match
+  the sentinel pattern). Surface the underlying helper stderr in the internal-error diagnostic. -
+  Reject commands with more than one REVIEW_FULL= token instead of silently picking the first match.
+  - Mark BLOCK_HELP / SENTINEL_PY / MIN_REVIEW_BYTES readonly. - Tighten header comment: drop
+  self-reference to this PR, drop the predecessor-vs-current narrative paragraphs, drop trailing
+  endorsement filler. Extend BLOCK_HELP with the REVIEW_FULL= parse-terminator rule.
+
+review_sentinel.py:
+
+- Annotate `_main(argv: Sequence[str])` (PY1 abstract-type rule). - Hoist subcommand alternation to
+  module-level `_SUBCOMMANDS` frozenset and reference it in the usage string (single source of
+  truth). - Use `os.path.join` rather than f-string `/` concatenation. - Tighten module docstring;
+  document parse-never-raises and the CLI exit-code contract.
+
+test.sh:
+
+- `INIT_SHA=$(...); export INIT_SHA` (conventional order). - Replace `xargs -r` (GNU-only) with a
+  portable while-read loop. - Pin `main_branch` via `git rev-parse --abbrev-ref HEAD` (works whether
+  `git init` defaulted to main or master). - Add 199/200-byte boundary tests for the size guard. -
+  Assert `lag=1/` in .agent-reviews/.hook.log for the first-parent merge test (pins --first-parent
+  semantics against rev-list regression).
+
+tests/claude_hooks/test_review_sentinel.py:
+
+- Replace `assert spec is not None` with `if ... raise RuntimeError` (PY4: assert-for-validation
+  prohibited). - Pin `pytest.raises(ValueError, match=...)`. - Add mid-string-uppercase bad-filename
+  case. - Add CLI tests: argv validation (missing-arg, unknown subcommand, no args), `path`
+  subcommand, and ValueError → exit-2 for both `make` and `path` on invalid SHAs.
+
+.claude/settings.json:
+
+- Trim the gate handler's `description` from ~1100 chars of duplicated prose to a one-sentence
+  summary pointing at the hook for the contract.
+
+SKILL.md:
+
+- Expand the PASS short-form to an explicit ≥200-byte template (header + PASS line + summary +
+  reviewed-at; agents following the literal template now produce files the gate accepts). - Clarify
+  that the `<REVIEW_PATH>` placeholder must be substituted before printing — don't emit the literal
+  placeholder in chat.
+
+42 bash + 144 python tests pass; pre-commit clean (ruff, pyright, pydoclint, shellcheck, mdformat,
+  codespell).
+
+* fix(claude-hooks): portable stat for size guard on BSD/macOS
+
+GNU `stat -c %s` isn't available on BSD-derived stat (notably macOS), where the equivalent flag is
+  `stat -f %z`. The pytest-driven gate tests on macos-latest CI failed with `stat: illegal option --
+  c` after the prior commit switched the size guard from `wc -c` to `stat -c %s`.
+
+Fall back to `stat -f %z` when the GNU form errors out (both produce a bare integer suitable for `[[
+  -lt ]]`). Apply the same fallback to the test sandbox fixtures so `bash agent/hooks/test.sh` works
+  on macOS too.
+
+* fix(claude-hooks): address Copilot re-review of BLOCK_HELP and CLI usage
+
+Two findings from the post-f18a743 Copilot pass:
+
+- BLOCK_HELP previously claimed `REVIEW_FULL="..."` is parsed with the quote embedded in the value.
+  The grep value-character class actually excludes both quote chars entirely, so a quoted path reads
+  as missing-REVIEW_FULL. Rewrite the help text to match. Also drop the inline backtick-quoted
+  single-quote that would have terminated the surrounding single-quoted heredoc on a future edit
+  (caught here when the prior wording broke the script under set -e). - `_USAGE` was generated as
+  `usage: review_sentinel.py {make | parse | path <arg>}`, which reads as if only `path` takes an
+  argument. Reformat to `usage: review_sentinel.py {make|parse|path} <arg>` so the `<arg>` applies
+  to every subcommand uniformly.
+
+
 ## v7.0.0 (2026-05-20)
 
 ### Chores
