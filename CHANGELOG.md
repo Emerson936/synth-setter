@@ -1,6 +1,458 @@
 # CHANGELOG
 
 
+## v8.6.0 (2026-05-24)
+
+### Chores
+
+- Repoint moved-configs refs missed in #1236 + test style cleanup
+  ([#1249](https://github.com/tinaudio/synth-setter/pull/1249),
+  [`fa419c3`](https://github.com/tinaudio/synth-setter/commit/fa419c367655bd76e8a81c4785ead7a15f5d42ee))
+
+* fix(skypilot): repoint moved-configs refs missed in PR #1236
+
+`DEFAULT_TEMPLATE` and the spec-mount canary's `file_mounts` source still pointed at the now-deleted
+  top-level `configs/` tree, so the launcher's `--template` default and the `test-skypilot-debug`
+  spec-mount lane were broken on merge.
+
+`DEFAULT_TEMPLATE` and the module docstring's `configs/...` references now anchor on
+  `src/synth_setter/configs/...`, matching `_LOCAL_DATA_DIR` and `_CRED_BOOTSTRAP_SCRIPT`'s
+  operator-side checkout pattern. The spec-mount template's self-mount path is updated to the new
+  in-package location.
+
+Also pin a `pyright: ignore` on the click-decorated `main()` entry point so the project-wide
+  false-positive that already trips pre-commit on this file becomes a single explicit waiver instead
+  of repeating the same noise on every touch.
+
+* style(tests): unify Path(str(...)) placement in schema-config tests
+
+The five `tests/schemas/test_*_config.py` files wrote the configs-dir-plus-subtree pattern as
+  `Path(str(configs_dir())) / "sub"`, while the existing pipeline-test callsites use the
+  `Path(str(configs_dir() / "sub"))` shape (join first, then materialize). Both forms produce the
+  same on-disk path under the unpacked installs that pytest runs against, but the latter mirrors the
+  production `configs_dir() / ...` callsite shape (see `as_file(configs_dir() / "compute" /
+  "X.yaml")` in `pipeline/skypilot_launch.py`).
+
+Move the join inside `str(...)` for the schema tests so the codebase has a single canonical reading
+  of "the trainer subdir of the packaged configs". No behaviour change.
+
+* fix(skypilot): catch missed configs/ ref in _WORKER_ENV_KEYS comment
+
+One stale top-level-configs reference slipped past the prior commit's docstring sweep — the
+  `_WORKER_ENV_KEYS` block at line 110 told readers to keep its tuple in sync with the `envs:` block
+  in `configs/compute/runpod-template.yaml`, which #1236 moved to
+  `src/synth_setter/configs/compute/runpod-template.yaml`.
+
+* docs: sweep five doc locations still on the pre-#1236 configs/ path
+
+Doc-drift advisory caught five places that still pointed at the top-level `configs/` tree #1236
+  deleted:
+
+- `architecture.md` — repo-root tree placed `configs/` next to `src/`; reseated as the last child
+  under `src/synth_setter/` so the diagram matches the wheel layout. - `data-pipeline.md` — code
+  block opened with `configs/` as a tree root even though the line above already used
+  `src/synth_setter/configs/`; tree root rewritten to match. -
+  `training-pipeline-implementation-plan.md` — three "Files to modify" entries
+  (`configs/data/*.yaml`, `configs/logger/wandb.yaml`, the second `configs/logger/wandb.yaml`)
+  prefixed with `src/synth_setter/`. - `eval-pipeline.md` — the "Zero hardcoded paths"
+  success-metric row gave `grep -r '/data/scratch' configs/` as the measurement command; with
+  `configs/` gone at repo root the command greps a non-existent path. Repointed at
+  `src/synth_setter/configs/`. - `doc-map.yaml` — two `covers:` strings (one inside the
+  `cli/generate_dataset.py` entry, one for `test-mps.yml`) still mentioned `configs/dataset.yaml`
+  and the `src/ + configs/` trigger pair; both updated for consistency with the rest of the doc-map.
+
+### Continuous Integration
+
+- **testing**: Broaden Codecov coverage signal across suites and platforms
+  ([#1219](https://github.com/tinaudio/synth-setter/pull/1219),
+  [`65148c2`](https://github.com/tinaudio/synth-setter/commit/65148c24c19163185c909b28f3d174e47528d3bf))
+
+* ci(testing): broaden Codecov coverage signal across suites and platforms
+
+Builds on the Codecov cleanup from #1211. Five focused changes:
+
+- **Add coverage upload to test-mps.yml, test-gpu.yml, test-vst-slow.yml.** These suites exercise
+  code paths the fast/slow CPU suites can't reach (MPS backend, CUDA kernels, VST plugin host).
+  Without an upload they read as 0% in Codecov and create perverse incentives to skip hard-path
+  tests. Each uploads under its own flag (`unit-mps`, `unit-gpu`, `vst`) guarded by `if: always() &&
+  hashFiles('coverage.xml') != ''` so a mid- suite crash still uploads partial coverage without
+  failing the job. - **Split unit-cpu into per-OS sub-flags.** Both ubuntu and macos jobs in
+  `test.yml` now upload under `unit-cpu,unit-cpu-<os>`. The parent `unit-cpu` flag preserves
+  historical carryforward while the per-OS flags surface platform-specific regressions that
+  carryforward would otherwise hide. - **Register the new flags in codecov.yml** with appropriate
+  path scope (vst is narrowed to the VST module + audio-metrics evaluator; GPU/MPS scope
+  `src/synth_setter/` only). - **Drop the `tools` component's `target: 50%` status override.** The
+  fixed 50% target was perpetually red and overrode the more useful `default_rules`
+  auto/no-regression baseline — losing the regression signal in exchange for a static,
+  non-actionable badge. Letting `tools` inherit `default_rules` restores regression detection. -
+  **Add missing `[tool.coverage.report].exclude_lines` patterns**: `if TYPE_CHECKING:`, `@overload`,
+  `@(abc\\.)?abstractmethod`, and ellipsis function bodies (`\\.\\.\\.\\s*$`, anchored to
+  end-of-line so inline ellipsis like `arr[..., :]` and `"wait..."` are not excluded). These
+  structurally-untestable lines inflate the uncovered count today.
+
+No enforcement changes — `informational: true` stays for both `project` and `patch` per the existing
+  roadmap on #14.
+
+Refs #14
+
+* chore(lint): apply review polish to coverage signal rollout
+
+- Collapse `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` into a single `if
+  (typing\\.)?TYPE_CHECKING:` regex and drop the bare `@overload` line (the `@(typing\\.)?overload`
+  regex below already covers both forms). Matches the style of `@(abc\\.)?abstractmethod` and
+  removes the dual- pattern asymmetry the code-health review flagged. - Tighten the codecov.yml
+  `unit-cpu` aggregate comment from 4 lines to 2 per CLAUDE.md cap-at-two; load-bearing why
+  (carryforward masking) leads. - Tighten the test-gpu.yml bind-mount comment from 4 lines to 2 with
+  the same edit pattern. - Add a one-line note on `unit-gpu` / `unit-mps` / `vst` flag paths
+  explaining why `scripts/ci/` is intentionally omitted (those suites don't exercise scripts/ci).
+
+* ci(testing): collect scripts/ci coverage in CPU pytest invocations
+
+`--cov=src` alone overrides `[tool.coverage.run].source` from `pyproject.toml`, so `scripts/ci/` was
+  silently absent from the coverage upload even though the unit-cpu/slow-cpu flag paths in
+  `codecov.yml` include it. Add `--cov=scripts/ci` to all three CPU pytest invocations (test.yml
+  ubuntu + macos, cpu-slow.yml) so the flag paths are no longer misleading and the `scripts-ci`
+  component receives real coverage data.
+
+Addresses Copilot review on PR #1219:
+  https://github.com/tinaudio/synth-setter/pull/1219#discussion_r3295210237
+
+### Features
+
+- **ci-automation**: Wire finalize-dataset into generate-dataset-shards.yaml + presubmit caller
+  ([#1214](https://github.com/tinaudio/synth-setter/pull/1214),
+  [`7aeaf2d`](https://github.com/tinaudio/synth-setter/commit/7aeaf2df818785ee05a3007c98a311aba4b64e0c))
+
+* feat(ci-automation): wire finalize-dataset into generate-dataset-shards.yaml + presubmit caller
+
+Adds a reusable `finalize-dataset.yaml` that runs `synth-setter-finalize-dataset` against an
+  already-generated run prefix on R2 (bare-runner install — no docker, no SkyPilot), and chains it
+  unconditionally after the `generate` job in `generate-dataset-shards.yaml` so every cron,
+  PR-presubmit, and manual dispatch caller gets finalize for free. The `generate` job now also
+  parses `run_id` out of the spec_uri sentinel and exposes it as a workflow_call output so finalize
+  composes its Hydra cfg against the same `data/<task>/<run_id>/` prefix generate wrote.
+
+Adds a path-filtered presubmit caller `.github/workflows/test-dataset-finalization.yml` that runs
+  the generate + finalize chain for the `[hdf5, wds]` matrix, then asserts the operator's `rclone
+  ls` invariant on the run prefix (`dataset.complete`, `stats.npz`, plus `train.h5` for the hdf5 row
+  — `val.h5`/`test.h5` are pruned because the smoke configs ship `train_val_test_sizes=[12, 0, 0]`).
+
+Adds `tests/integration/test_finalize_artifact_oracle.py` — the helper PR #1202's operator comment
+  asked for. Loads the finalized train split, runs `surge/fake_oracle`'s `predict_step` over the
+  loaded `param_array`, and pins three oracle invariants from `tests/test_train.py`'s oracle leg:
+  predict_step returns batch params verbatim, per-param MSE is exactly zero, and `training_step`
+  loss is exactly zero with a grad-bearing tensor. Audio-metric bounds (`mss < 15`, etc.) require
+  Surge XT rendering and stay behind `requires_vst` in `test_train.py`. Helper auto-skips when R2 is
+  unreachable (matches `tests/integration/test_finalize_dataset_r2.py`).
+
+Branch is currently stacked on `feat/finalize-dataset-hdf5-branch` (Phase 2 / #1202); retargets to
+  `main` once #1202 merges.
+
+Closes #1184
+
+* fix(configs): materialize run_id key so finalize workflow's Hydra override resolves (#1214)
+
+The Finalize Dataset workflow invokes ``synth-setter-finalize-dataset experiment=... run_id=${{
+  inputs.run_id }}`` to pin generate's deterministic run_id onto finalize's compose. The composed
+  ``configs/dataset.yaml`` did not list ``run_id`` (it lived only as a ``default_factory`` on
+  ``DatasetSpec``), so Hydra's strict mode rejected the override with
+
+Could not override 'run_id'. To append to your config use +run_id=smoke-shard-...
+
+failing both matrix cells (hdf5 + wds) of the finalize presubmit run
+  https://github.com/tinaudio/synth-setter/actions/runs/26183345657/job/77036147079.
+
+Materialize the key as ``run_id: null`` so the override-form resolves.
+  ``DatasetSpec._normalize_r2_input``'s mode='before' validator calls ``_fill_default_r2_prefix``
+  which already pre-fills ``data['run_id']`` from ``task_name`` + ``created_at`` whenever the value
+  is falsy, so the generate path that relies on the ``default_factory`` keeps deriving the same
+  run_id it always did. Compose verified locally for all seven
+  ``configs/experiment/generate_dataset/*.yaml`` siblings (default ``run_id=<task>-<UTC>``) and for
+  the override path (``run_id=smoke-shard-20260520T190157931Z`` resolves verbatim).
+
+Mirrors the gui_toggle_cadence fix on PR #1204: the workflow contract (``key=value`` not
+  ``+key=value``) is correct; only the config materialization was missing.
+
+Refs #1214
+
+* fix(pipeline): per-field dtype contract honors writer's float16 audio storage
+
+`check_shard_contracts` hard-coded `np.float32` for every dataset; the real writer emits audio as
+  float16 (Blosc2-compressed for storage efficiency) and mel_spec / param_array as float32. The
+  smoke-shard finalize cell was therefore rejecting legitimate generate output:
+
+shard /tmp/.../shard-000000.h5: dataset 'audio' has dtype float16, expected np.float32.
+
+Replace the uniform constant with a per-field map exposed from
+  `synth_setter.data.vst.shapes.DATASET_FIELD_DTYPES` so writer and validator can never disagree.
+  The map also threads through `reshard.py`'s VirtualLayout / VirtualSource so each split file
+  declares the per-field dtype the source shards actually carry.
+
+Adds two regression tests pinning the contract end-to-end:
+
+- `test_audio_as_float32_fails_loud_under_contract` — the original finalize failure inverted (audio
+  written as float32 is rejected with the float16 expected dtype in the message). -
+  `test_mel_spec_as_float16_fails_loud_under_contract` — mel written as float16 is rejected with
+  float32 expected, confirming each field has its own declared dtype (the contract did not collapse
+  to "audio's dtype" or "any float").
+
+Existing `test_wrong_dtype_fails_loud` is repointed at the new contract (audio float64 -> expected
+  float16). Test fixtures that previously wrote audio as float32 now use
+  `DATASET_FIELD_DTYPES["audio"]` so the dtype check passes before the row-count / trailing-shape
+  assertions get a chance to run.
+
+Also fixes two PR-1214 review items and one unrelated regression introduced by 1b20eea:
+
+- `_DEFAULT_BUCKET` in `test_finalize_artifact_oracle.py` was defined and unused; remove it (Copilot
+  review). - `finalize-dataset.yaml`'s `workflow_dispatch.env_ref` default is empty string;
+  `actions/checkout` then sees `ref: ""` and falls back unpredictably. Default to `github.sha` when
+  blank (Copilot review). - `configs/dataset.yaml`'s `run_id: null` (added by 1b20eea so the
+  finalize workflow's Hydra override resolves) bypassed the spec's default_factory whenever
+  `r2.prefix` was operator-supplied (the prefix-fill branch was the only path that materialized
+  run_id). Drop `run_id` from the input dict when it arrives as `None` so the `default_factory`
+  fires; two new tests under `TestDatasetSpecConstruction` pin both the null-only and
+  null-plus-explicit-r2.prefix paths.
+
+* fix(ci-automation): verify-artifacts per-matrix-cell run_id via downloaded spec
+
+`needs.smoke-pipeline.outputs.run_id` flattens to a single value when the upstream is a matrix job
+  (GHA limitation), so `verify-artifacts (wds)` resolved its prefix under the hdf5 cell's run_id and
+  missed the wds finalize artifacts entirely:
+
+missing finalize artifacts at
+  r2:intermediate-data/data/smoke-shard-wds/smoke-shard-20260520T203722366Z/
+
+(note the smoke-shard-wds task path + smoke-shard run_id mismatch).
+
+The per-matrix run-metadata artifact (`finalize-presubmit-${output_format}`) is already uploaded by
+  the reusable's generate job — download it per verify cell and parse `run_id` straight from the
+  bundled `input_spec.json`. Each verify entry then targets the cell's own R2 prefix without
+  depending on the shared `needs.outputs.*` keys.
+
+* fix(ci-automation): include run_id in finalize log artifact name
+
+Matrix callers invoke `finalize-dataset.yaml` multiple times in one workflow run
+  (test-dataset-finalization.yml has rows for hdf5 + wds). The artifact name previously keyed only
+  on `provider` + `output_format`, and `generate-dataset-shards.yaml` forwards `output_format` via
+  Hydra overrides rather than the reusable's `inputs.output_format`, so both matrix cells hit
+  `upload-artifact@v4` with identical names and the second upload fails.
+
+Append `inputs.run_id` (always required, per-cell from the generate stage) as the discriminator and
+  default `output_format` to `na` when unset.
+
+Addresses Copilot review comment on PR #1214.
+
+* fix(ci-automation): update configs path after #1236 in-package move
+
+The verify-artifacts job's `Resolve R2 bucket` step composed Hydra against `Path.cwd() / "configs"`,
+  but #1236 (commit 2a80910b on main) moved the configs tree into `src/synth_setter/configs/` and
+  the rebase pulled that change in. The step failed with `MissingConfigException: Primary config
+  directory not found` for both hdf5 and wds matrix cells.
+
+Point `initialize_config_dir` at the new in-package on-disk path so this step keeps avoiding the
+  heavier `pip install -e .` just to read one Hydra value.
+
+* fix(ci-automation): mask degenerate mel bins on the smoke finalize cells (#1238)
+
+* fix(ci-automation): thread mask_degenerate_bins through finalize for smoke configs
+
+The wds smoke matrix cell in `test-dataset-finalization.yml` was failing finalize with:
+
+ValueError: Found 2002 mel bin(s) with zero variance across the dataset (std shape (2, 128, 401);
+  ...). Rerun with --mask-degenerate-bins to mask these bins instead of failing.
+
+The smoke configs render 12 samples, and `surge_simple`'s rendered audio deterministically produces
+  constant mel positions at early frames (attack-time silence) and at channels below the source's
+  active bandwidth. Welford reports the exact zero variance and `stream_stats_wds` raises by
+  default. The hdf5 smoke cell happened to pass only because dask's two-pass std introduces FP noise
+  that lands the same positions just above zero — same data, different rounding.
+
+`get_stats_hdf5` / `stream_stats_wds` already accept `mask_degenerate=True` to substitute std=1.0 at
+  degenerate positions (which yields `(spec - mean) / std == 0` on the constant-bin training
+  distribution). `synth-setter-finalize-dataset` was not surfacing the knob.
+
+- Add `mask_degenerate_bins: false` to `configs/dataset.yaml` (default strict for production
+  datasets). - Thread the flag through `finalize_wds` / `finalize_hdf5` / `main`. - Register
+  `mask_degenerate_bins` in `_NON_SPEC_KEYS` so it is popped before `DatasetSpec` construction. -
+  Override `mask_degenerate_bins: true` in `smoke-shard.yaml` and `smoke-shard-wds.yaml` so the CI
+  smoke matrix completes; both rows get the same setting so the hdf5 row does not regress when FP
+  noise stops hiding constant bins. - Pin the wire with
+  `test_finalize_wds_forwards_mask_degenerate_bins_to_stream_stats`.
+
+* review: tighten finalize mask-degenerate-bins comments + add hdf5 wire test
+
+Address the multi-skill review WARNs on the prior commit:
+
+- Trim multi-line YAML/docstring essays to one-line contracts; the rationale for smoke-only opt-in
+  lives in the PR body and the commit message rather than rotting in long-lived comments. - Add
+  `test_finalize_hdf5_forwards_mask_degenerate_bins_to_get_stats`, parametrized over `[True, False]`
+  so the hdf5 branch wire is pinned at the same fidelity as the wds branch. Re-shape the wds test
+  the same way so the False direction is also pinned (would have caught a hard-wired-True regression
+  that the prior single-polarity assertion missed). - Collapse the `_NON_SPEC_KEYS` entry comment to
+  a trailing `#` annotation matching the implicit style of the other tuple entries.
+
+* review: surface mask_degenerate_bins as a DatasetSpec field
+
+Address PR #1238 self-review comment (r3284048315) — the finalize stats-fold knob belongs on the
+  spec, not as a sidecar cfg key threaded through finalize_wds / finalize_hdf5 as a parallel kwarg.
+
+- Add ``mask_degenerate_bins: bool = False`` to ``DatasetSpec`` (strict default unchanged; smoke
+  configs already override to ``true`` at the experiment layer). - Drop the ``_NON_SPEC_KEYS``
+  carve-out; the key is now a real spec field and flows through ``spec_from_cfg`` without
+  special-casing. - Drop the kwarg from ``finalize_wds`` / ``finalize_hdf5``; both now read
+  ``spec.mask_degenerate_bins`` directly. ``main()`` no longer reads ``cfg.get(...)`` because
+  ``spec_from_cfg`` already captures the value. - Update the two parametrized wire tests to set the
+  flag via ``_build_{wds,hdf5}_smoke_spec(mask_degenerate_bins=flag)`` so they pin the spec → fold
+  path the production code now uses. - Extend ``_make_valid_spec`` in ``test_validate_spec.py`` to
+  include the new field; ``validate_structure``'s required-set derives from ``model_fields`` so
+  adding the field automatically tightens the structural check.
+
+* fix(ci-automation): wds oracle helper concatenates batched records
+
+`synth_setter.data.vst.writers.save_wds_samples` emits one tar record per render batch carrying a
+  `(B, P)` `param_array.npy` payload, but the finalize-oracle helper was `np.stack`-ing the records
+  and yielding a `(num_records, B, P)` cube. The verify-artifacts wds cell tripped on the
+  `num_samples, num_params = param_array.shape` unpacking in
+  `test_finalize_train_split_passes_fake_oracle_invariants`.
+
+Switch the helper to `np.concatenate` so per-record `(B, P)` batches flatten to `(sum(B), P)`. Add a
+  sibling unit-level fixture file pinning the writer's actual on-disk shape — multi-record concat,
+  single batched record, out-of-order tar entries, empty shard, hdf5 sanity — so a future layout
+  drift between writer and reader fails at unit speed instead of only after a live R2 generate +
+  finalize.
+
+Refs #1184
+
+### Refactoring
+
+- **code-health**: Ship configs/ and the headless VST wrapper inside the package
+  ([#1236](https://github.com/tinaudio/synth-setter/pull/1236),
+  [`2a80910`](https://github.com/tinaudio/synth-setter/commit/2a80910b775bf268c60edec8d40404aef1808a91))
+
+* refactor(code-health): ship configs/ and the headless wrapper inside the package
+
+Move `configs/` to `src/synth_setter/configs/` and `docker/ubuntu22_04/run-linux-vst-headless.sh` to
+  `src/synth_setter/scripts/run-linux-vst-headless.sh`. Locate both via
+  `importlib.resources.files("synth_setter")` instead of `Path(__file__).resolve().parents[N]` walks
+  or bare relative paths so they keep working under any install layout (editable, wheel, zip).
+
+Adds `src/synth_setter/resources.py` exposing `configs_dir()` and `vst_headless_wrapper()` helpers
+  (Traversable-returning, with `as_file` re-exported for subprocess callers on zipped wheels). Wires
+  `[tool.setuptools.package-data]` so the YAMLs and `.sh` ship in the wheel.
+
+All callsites updated: Python (CLIs, materialize_spec, surge_xt_interactive, tests), Hydra
+  `@hydra.main(config_path=...)` decorators, programmatic `initialize_config_dir` sites, GHA
+  workflows, SkyPilot compute templates, Dockerfile COPY, Makefile, and docs.
+
+Refs #1235 Refs #1122 Part of #223
+
+* refactor(code-health): resolve packaged configs via pkg:// + as_file()
+
+Completes the configs/headless-wrapper packaging refactor by closing the zipped-wheel hole the
+  previous commit left open. Flips every Hydra entrypoint and programmatic compose site from
+  filesystem-relative paths to ``pkg://synth_setter.configs`` / ``initialize_config_module``, wraps
+  every subprocess argv build in ``as_file()`` so the wrapper survives a zip-import install, and
+  ships a Hydra SearchPathPlugin so downstream apps auto-discover the configs after ``pip install``.
+
+What changed (vs. the previous commit on this branch):
+
+- ``cli/{train,eval,generate_dataset}.py``: ``@hydra.main(config_path= "pkg://synth_setter.configs",
+  ...)``. The relative ``config_path="../configs"`` previously broke under zipimport. -
+  ``cli/{finalize_dataset,generate_dataset}.py``, ``pipeline/ci/ materialize_spec.py``, and 8 test
+  files: ``initialize_config_dir( config_dir=str(configs_dir()))`` -> ``initialize_config_module(
+  config_module="synth_setter.configs")``. - ``cli/generate_dataset.py`` /
+  ``tools/surge_xt_interactive.py``: ``as_file()`` + ``ExitStack`` wrap the subprocess invocation so
+  the wrapper path stays valid across retries and zipped-wheel installs. Drops the module-level
+  ``_VST_HEADLESS_WRAPPER`` constant from ``surge_xt_interactive``; the argv builder now requires
+  the caller to pass a real, materialized ``wrapper_path`` on Linux. -
+  ``src/hydra_plugins/synth_setter_searchpath/__init__.py``: new Hydra SearchPathPlugin that appends
+  ``pkg://synth_setter.configs`` to every search path. Auto-discovered via the top-level
+  ``hydra_plugins`` namespace package shipped in the wheel. - ``pyproject.toml``: ``namespaces =
+  true`` so setuptools picks up the ``hydra_plugins`` namespace package alongside the regular
+  ``synth_setter`` package. - ``resources.py``: docstring re-oriented so ``as_file()`` is the
+  install-layout-safe default and ``str(traversable)`` is documented as the unpacked-wheel shortcut.
+  - ``tests/data/vst/test_preset_params.py``: tighten the skip-message spacing. - Docs: every
+  ``configs/`` path reference under ``docs/`` updated to ``src/synth_setter/configs/``.
+
+Verification (all run in this commit):
+
+- ``ruff check`` / ``ruff format --check`` / ``pydoclint`` clean. - Fast suite: 1391 passed, 232
+  deselected. - Targeted 425-test bundle (tests/test_configs, tests/schemas,
+  tests/pipeline/test_configs, tests/pipeline/test_entrypoints, tests/pipeline/test_ci,
+  tests/claude_hooks/test_settings_hooks): 425 passed. -
+  ``initialize_config_module(config_module="synth_setter.configs")`` composes
+  ``experiment=generate_dataset/smoke-shard`` from /tmp. -
+  ``Plugins.instance().discover(SearchPathPlugin)`` contains ``SynthSetterSearchPathPlugin``
+  (auto-discovered). - ``python -m build`` ships ``hydra_plugins/`` + 152 entries under
+  ``synth_setter/configs/`` and ``synth_setter/scripts/`` in the wheel. - Fresh ``uv venv`` + wheel
+  install + ``cd /tmp`` + compose: composes the same spec; ``as_file(vst_headless_wrapper())``
+  resolves under the site-packages install.
+
+* refactor(pipeline): anchor REPO_ROOT on rootutils.setup_root return
+
+Reuse the project-root Path returned by ``rootutils.setup_root`` instead of a duplicate
+  ``Path(__file__).resolve().parents[4]`` walk. Same behavior, but the anchor no longer breaks if
+  this module moves.
+
+Mirrors the pattern already in ``src/synth_setter/tools/surge_xt_interactive.py``.
+
+Addresses PR #1236 review comment 3291278211.
+
+### Testing
+
+- **testing**: Add duck-typed FakeVST3Plugin for VST-free e2e shard renders
+  ([#1234](https://github.com/tinaudio/synth-setter/pull/1234),
+  [`b0ae4e0`](https://github.com/tinaudio/synth-setter/commit/b0ae4e0654da21f89c419d24b9af9360928d1324))
+
+* test(testing): add duck-typed FakeVST3Plugin for VST-free e2e shard renders
+
+Today every E2E test that exercises the dataset pipeline (make_hdf5_dataset, render_params) needs a
+  real Surge XT .vst3 bundle and an X11 display, so PR-time runners skip them and only the nightly
+  job exercises the batch loop, HDF5 writer, mel-spec, RenderConfig wiring, and gui_toggle_cadence
+  end-to-end.
+
+This change adds a duck-typed FakeVST3Plugin satisfying the six attributes / methods core.py touches
+  (version, parameters[k].raw_value, show_editor, load_preset, reset, process). process emits a
+  deterministic sine derived from the first note_on event — loud enough to clear _MIN_LOUDNESS=-55
+  dB so the pipeline writes a complete shard — or silence on flush calls. show_editor blocks on the
+  close_event mirroring the real plugin's editor_held_open contract.
+
+Two new pytest fixtures (fake_vst3_plugin, install_fake_plugin) live in tests/data/vst/conftest.py
+  and monkeypatch core.load_plugin / core.VST3Plugin. A new fake_vst marker selects the fast suite.
+  tests/data/vst/test_fake_plugin_e2e.py mirrors test_always_on_integration.py's HDF5 assertions but
+  runs with no real plugin and no X11 — proving the always_on held-editor path round-trips under the
+  fake in 1.1 s.
+
+Existing requires_vst tests are unaffected: install_fake_plugin only applies when a test explicitly
+  depends on it, and the nightly real-VST job continues to exercise the Steinberg loader and JUCE
+  state handling the fake does not cover.
+
+Follow-up: wire a fake-vst-e2e CI job that runs the fake_vst marker on every PR. Tracked separately.
+
+Closes #1233
+
+* test(testing): address Copilot review feedback on PR #1234
+
+Bug fixes - _fake_plugin.py: widen midi_events payload from `bytes` to `Sequence[int]` so the fake
+  matches what `mido.Message.bytes()` actually produces (comment #3277676197) - test_fake_plugin.py:
+  replace `time.sleep(0.1)` in show_editor blocking test with an instrumented `close_event.wait`
+  wrapper that signals an `entered_wait` Event — assertion now observes the worker entering the
+  blocking call instead of relying on a timing margin (comment #3277676144) -
+  test_fake_plugin_e2e.py: tighten editor-crash assertion to `fake_logger.exception.call_count ==
+  0`, mirroring the canonical pattern in test_always_on_integration.py (comment #3277676213)
+
+Performance - _fake_plugin.py: flush calls (`midi_events=[]`) now return a zero-length `(channels,
+  0)` buffer instead of allocating a full ~11MB silence array; `core.render_params` discards the
+  flush return value, so the allocation was pure waste (comment #3277676176). Contract test renamed
+  accordingly.
+
+DRY / dedup - test_fake_plugin_e2e.py: drop the local `_render_cfg` helper and reuse the canonical
+  one from `test_generate_vst_dataset.py` via `RenderConfig.model_copy (update=...)` for the three
+  fake-specific fields (comment #3277676229).
+
+Refs #1233
+
+
 ## v8.5.2 (2026-05-22)
 
 ### Bug Fixes
