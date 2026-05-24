@@ -1,10 +1,9 @@
 [project]
 name = "synth-setter"
-version = "8.6.0"
+version = "8.7.0"
 description = "Studying the effect of permutation symmetry on audio synthesiser parameter inference."
 authors = [{name = "Khaled Tinubu"}, {name = "tinaudio"}]
 readme = "README.md"
-# Upper bound stops the resolver chasing future Pythons with no torch wheels.
 requires-python = ">=3.10,<3.14"
 dependencies = [
   # --------- hydra --------- #
@@ -137,6 +136,45 @@ all = [
 # Note the dev group includes docs via `include-group`; the matching
 # [project.optional-dependencies].dev shim does NOT — `uv pip install .[dev]`
 # keeps its pre-#1247 behavior of installing dev tools only.
+
+[project.scripts]
+synth-setter-train = "synth_setter.cli.train:main"
+synth-setter-eval = "synth_setter.cli.eval:main"
+synth-setter-generate-dataset = "synth_setter.cli.generate_dataset:main"
+synth-setter-generate-dataset-from-hydra = "synth_setter.cli.generate_dataset:from_hydra"
+synth-setter-finalize-dataset = "synth_setter.cli.finalize_dataset:main"
+synth-setter-spec-uri = "synth_setter.pipeline.ci.spec_uri:main"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 [dependency-groups]
 docs = [
   "mkdocs",
@@ -207,42 +245,6 @@ torchaudio = [
 ]
 
 
-[project.scripts]
-synth-setter-train = "synth_setter.cli.train:main"
-synth-setter-eval = "synth_setter.cli.eval:main"
-synth-setter-generate-dataset = "synth_setter.cli.generate_dataset:main"
-synth-setter-generate-dataset-from-hydra = "synth_setter.cli.generate_dataset:from_hydra"
-synth-setter-finalize-dataset = "synth_setter.cli.finalize_dataset:main"
-synth-setter-spec-uri = "synth_setter.pipeline.ci.spec_uri:main"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 [tool.setuptools.packages.find]
 # PEP src-layout: ``synth_setter`` (regular package) plus the ``hydra_plugins``
@@ -264,6 +266,7 @@ namespaces = true
   "configs/**/*.yml",
   "scripts/*.sh",
 ]
+
 
 
 [tool.pytest.ini_options]
@@ -296,6 +299,7 @@ markers = [
 minversion = "6.0"
 pythonpath = ["src"]
 testpaths = "tests/"
+
 
 
 [tool.ruff]
@@ -382,6 +386,7 @@ ignore = ["E501", "S101"]
 "src/synth_setter/utils/utils.py" = ["D102", "D103", "D107"]
 
 
+
 [tool.interrogate]
 verbose = 2
 fail-under = 80
@@ -462,6 +467,7 @@ minor_tags = ["feat"]
 patch_tags = ["fix", "perf", "revert"]
 
 
+
 [tool.coverage.run]
 source = ["src/synth_setter", "scripts/ci"]
 branch = true
@@ -487,6 +493,7 @@ exclude_lines = [
     "@(abc\\.)?abstractmethod",
     "\\.\\.\\.\\s*$",
 ]
+
 
 
 [tool.mutmut]

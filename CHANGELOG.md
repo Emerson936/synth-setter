@@ -1,6 +1,164 @@
 # CHANGELOG
 
 
+## v8.7.0 (2026-05-24)
+
+### Chores
+
+- **deps**: Introduce uv.lock + hybrid PyTorch routing
+  ([#1248](https://github.com/tinaudio/synth-setter/pull/1248),
+  [`4d2c5c8`](https://github.com/tinaudio/synth-setter/commit/4d2c5c88ae90b06f3b497250c0f9163895452c06))
+
+* chore(deps): introduce uv.lock + hybrid PyTorch routing
+
+Lay the foundation for reproducible dependency installs by committing a universal `uv.lock` and
+  routing PyTorch wheels per platform from `pyproject.toml`. Phase 2 (#1245) flips CI from `uv pip
+  install` to `uv sync --frozen` and removes the backward-compat shim extras left in place here.
+
+Changes - `requires-python = ">=3.10,<3.14"` — upper bound prevents the resolver from chasing future
+  Python versions with no torch wheels. - Move `torch`, `torchvision`, `torchaudio`, `lightning`,
+  `torchmetrics` from the `[torch]` extra into regular `dependencies`. Routing now lives in
+  `[tool.uv.sources]`, not the extra. - Add `[project.optional-dependencies].cpu` and `.cu128`
+  backend extras. Two extras are required: uv's `conflicts` declaration needs >=2 entries, so the
+  single-extra "default = CUDA on Linux" pattern in #1243's design is not accepted by the resolver.
+  - Add `[dependency-groups]` with `dev` (transitively including `docs`). - Add `[tool.uv]`
+  `conflicts` declaring `cpu` and `cu128` mutually exclusive — needed so uv locks each branch
+  independently into the universal lock instead of trying to satisfy both at once. - Add
+  `[[tool.uv.index]]` entries for pytorch-cpu and pytorch-cu128 (both `explicit = true`). - Add
+  `[tool.uv.sources]` routing torch/torchvision/torchaudio per extra + platform marker. lightning
+  and torchmetrics deliberately excluded — they are pure-Python and the pytorch indexes do not host
+  them. - Relax `scipy==1.14.1` -> `scipy>=1.14,<1.15`. A hard patch-pin risks backtracking against
+  torch / librosa / kymatio during lock resolution. - Bump pre-commit validate-pyproject `v0.18` ->
+  `v0.25` to support PEP 735 `[dependency-groups]`. - Generate and commit `uv.lock` (328 packages).
+
+Command surface introduced (CI cutover lands in #1245)
+
+- `uv sync --extra cu128` — GPU box (CUDA 12.8) - `uv sync --extra cpu --no-default-groups --group
+  dev` — GPU-less CI - `uv sync --only-group dev` — lint/type-check (no torch) - `uv sync` — macOS
+  (MPS via PyPI) - `uv lock --check` — verify lock matches `pyproject.toml`
+
+Verification - `uv lock --check` passes. - `uv sync --frozen --extra cpu --no-default-groups --group
+  dev` resolves `torch==2.12.0+cpu` from pytorch-cpu. - `uv sync --frozen --extra cu128
+  --no-default-groups --group dev` resolves `torch==2.11.0+cu128` from pytorch-cu128. - `uv sync
+  --frozen --only-group dev` installs pyright/ruff/pytest without torch.
+
+Backward compatibility - `torch`, `dev`, `docs`, `all` extras retained as shims so existing `uv pip
+  install -e ".[torch,dev]"` calls in CI keep working. `uv pip` does not honor `[tool.uv.sources]`,
+  so those callsites continue to resolve from PyPI as they did before this PR. Removal of the shims
+  lands in #1245 alongside the `uv sync --frozen` cutover. - The Dockerfile's `uv pip install
+  --torch-backend ${TORCH_BACKEND} --extra torch --extra dev` continues to work — the `[torch]` shim
+  still lists the packages, and `--torch-backend` configures the index at `uv pip` time.
+
+Refs #1247 Refs #1244 Refs #1243
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* chore(deps): clarify shim ownership + pin comment style
+
+Address review feedback from repo-review-full-no-comments:
+
+- Note that the `cpu` and `cu128` extras must stay byte-identical (routing lives in
+  `[tool.uv.sources]`, not the extra contents) so a future torch bump doesn't produce a split
+  lockfile. - Expand the shim block comment to cover all four extras explicitly (`torch` is now a
+  no-op; `dev`/`docs` mirror the new groups minus the `include-group` relationship). - Document that
+  the `[dependency-groups].dev` group includes `docs` while the
+  `[project.optional-dependencies].dev` extra does not — preserves pre-#1247 `uv pip install .[dev]`
+  behavior. - Normalize the scipy pin comment to the same `# Pin: ...` style used by the kubernetes
+  co-pin block.
+
+No functional changes; `uv lock --check` still resolves 328 packages.
+
+Refs #1247
+
+* docs: refresh stale pyproject references for #1247
+
+Two factual contradictions introduced by the uv.lock foundation PR:
+
+- `docs/getting-started.md`: `requires-python = ">=3.10"` was inlined as a literal that now
+  mismatches `pyproject.toml`'s `>=3.10,<3.14`. Rewrite drift-resistant: point at the field, give
+  the current bound parenthetically. - `docs/reference/github-actions.md`: the GPU-runner section
+  referred to "the `torch` extra in `pyproject.toml`" as the version source-of- truth. After #1247
+  the `torch` extra is a backward-compat no-op shim; the version floor lives in
+  `[project.dependencies]`. Re-point the sentence at the right field.
+
+Substantive Appendix A.4 + README "GPU vs CPU" rewrites (new `uv sync --extra cu128|cpu` command
+  surface, `[dependency-groups]`, `uv.lock` workflow) deferred to Phase 3 (#1246) per the epic's
+  split.
+
+Refs #1247 Refs #1246
+
+* fix(ci): preserve no-torch install paths for #1247 callsites
+
+Pre-#1247 both callsites relied on torch being optional. Now the torch stack is mandatory in
+  `[project.dependencies]` for universal-lock resolution, so a bare `-e .` or `.[dev]` formally
+  pulls torch.
+
+`test-dataset-generation-render-matrix.yml` contract job: switch to `uv pip install --no-deps -e .`
+  plus an explicit module-load surface (hydra-core + colorlog, rootutils, loguru, python-dotenv,
+  pydantic, pedalboard, mido, numpy). Validator still fires inside `spec_from_cfg` before any
+  torch-importing module loads, and the job stays well under a minute as the inline comment
+  promises.
+
+`environment.yaml`: pip's `.[dev]` now formally overlaps with the conda-installed torch packages;
+  rewrite the comment to describe the real contract — pip's already-satisfied skip keeps conda's
+  binaries authoritative as long as the matched specs in this file stay >= the project's lower
+  bounds. No install-line change needed.
+
+#1245 folds both callsites back onto the canonical `uv sync --frozen` install path.
+
+* chore(deps): clarify [tool.uv.sources] marker scope + pin validator install closure
+
+Address Copilot review feedback on #1248:
+
+* `pyproject.toml`: reword the `[project.optional-dependencies]` header so it no longer claims the
+  cpu/cu128 extras themselves are marker-gated. The `sys_platform == 'linux' or 'win32'` markers
+  live on the source routing in `[tool.uv.sources]`; macOS just falls through to PyPI because bare
+  `uv sync` activates neither extra. (review comment 3291389406)
+
+* `.github/workflows/test-dataset-generation-render-matrix.yml`: mirror `[project].dependencies`
+  exact pins (`hydra-core==1.3.2`, `hydra-colorlog==1.2.0`, `loguru==0.7.3`) on the hand-picked
+  validator-only install closure so the contract job cannot drift past the project's locked versions
+  while #1245 has not yet folded this callsite back onto `uv sync --only-group dev`. (review comment
+  3291389441)
+
+* chore(deps): fix invalid marker example in pyproject.toml comment
+
+The [project.optional-dependencies] header used `sys_platform == 'linux' or 'win32'` as an inline
+  example — that is not a valid PEP 508 marker. The correct form repeats the LHS: `sys_platform ==
+  'linux' or sys_platform == 'win32'`. Aligns the comment with the actual markers in
+  [tool.uv.sources] (which were already correct).
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Features
+
+- **pipeline**: Default rank/world to (0, 1) when partition env absent (#1251)
+  ([#1252](https://github.com/tinaudio/synth-setter/pull/1252),
+  [`b9a2825`](https://github.com/tinaudio/synth-setter/commit/b9a282583a9ece42028bb7c1da7166e76c9ae4bf))
+
+Both env vars absent → read_rank_world_from_env returns (0, 1), so ``synth-setter-generate-dataset``
+  runs locally without exporting partition env. Partial config (only one set) still raises — that
+  pattern almost always means a launcher dropped half its env injection, and silently coercing it
+  would duplicate every shard across every node (the #763 invariant we're preserving).
+
+Defense-in-depth tests pin the env-var contract: - launcher always injects WORKER_RANK /
+  NUM_WORKERS, even in single-worker mode, so a future regression that drops the injection can't
+  silently fall back to the worker default - an integration test runs two ranks across the real
+  subprocess boundary and asserts a disjoint + complete shard partition, catching name drift between
+  the launcher and the worker
+
+The nightly-parallel-datagen workflow drops the now-redundant hardcoded env vars so it exercises the
+  new default end-to-end in CI.
+
+Drive-by: ``available_cpus`` now binds ``sched_getaffinity`` via ``getattr`` instead of attribute
+  access so pyright's narrowing works across platforms (macOS pyright doesn't know about the
+  Linux-only attribute, even with hasattr guarding it).
+
+Fixes #1250
+
+
 ## v8.6.0 (2026-05-24)
 
 ### Chores
