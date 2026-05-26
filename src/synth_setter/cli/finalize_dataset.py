@@ -155,21 +155,19 @@ def finalize_hdf5(spec: DatasetSpec, work_dir: Path) -> None:
     logger.info("uploaded stats to {}", spec.r2.stats_uri())
 
 
-def run(cfg: DictConfig) -> None:
-    """Load DatasetSpec from ``cfg.dataset_spec_uri``, dispatch on ``output_format``, marker last.
+def finalize(cfg: DictConfig) -> None:
+    """Finalize the R2 prefix for ``cfg.dataset_spec_uri``; idempotent on ``dataset.complete``.
 
-    Skips the body entirely when ``dataset.complete`` already exists at the
-    run prefix — R2 is the source of truth (per ``pipeline/CLAUDE.md``), so
-    a second invocation against a finalized prefix is a no-op rather than a
-    full redo. ``cfg.paths.output_dir`` is the per-run scratch directory
-    (``@hydra.main`` allocates it before this runs, and ``run`` creates it
-    when missing for direct callers); finalize writes shards, splits,
-    ``stats.npz`` and the marker there, and the directory is retained for
-    post-mortem unless cleaned externally.
+    Returns without work when the marker already exists at the run prefix —
+    R2 is the source of truth (per ``pipeline/CLAUDE.md``). The branch on
+    ``spec.output_format`` writes the derived artifacts; the marker is
+    uploaded strictly last so an interrupted run never advertises artifacts
+    that have not landed.
 
     :param cfg: Composed cfg with ``dataset_spec_uri`` (URI accepted by
         :func:`~synth_setter.pipeline.spec_io.load_spec_from_uri`) and
-        ``paths.output_dir`` (created if missing).
+        ``paths.output_dir`` (writable scratch dir; created if missing;
+        retained after the call, multi-GB on the hdf5 branch).
     :raises ValueError: ``spec.output_format`` is neither ``"hdf5"`` nor ``"wds"``.
     """
     r2_io.ensure_r2_env_loaded()
@@ -201,11 +199,11 @@ def run(cfg: DictConfig) -> None:
     config_name="finalize_dataset",
 )
 def main(cfg: DictConfig) -> None:
-    """Operator CLI: thin @hydra.main wrapper around :func:`run`.
+    """@hydra.main entrypoint; delegates to :func:`finalize` for the contract.
 
-    :param cfg: Hydra-composed cfg; see :func:`run` for the field contract.
+    :param cfg: Hydra-composed cfg; see :func:`finalize` for the field contract.
     """
-    run(cfg)
+    finalize(cfg)
 
 
 if __name__ == "__main__":
