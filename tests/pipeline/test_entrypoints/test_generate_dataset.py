@@ -913,6 +913,37 @@ class TestRun:
         assert "rendered=2" in summary_lines[0]
         assert "skipped=1" in summary_lines[0]
 
+    @patch("synth_setter.cli.generate_dataset.logger")
+    def test_run_logs_generation_speed_from_rendered_samples(
+        self,
+        mock_logger: MagicMock,
+        patched_subprocess: MagicMock,  # noqa: ARG002
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Speed log line counts only ``rendered`` shards, not skipped ones.
+
+        :param mock_logger: Captures the speed log line's content.
+        :param patched_subprocess: Fixture-activation only.
+        :param tmp_path: Used by ``_multi_shard_spec``.
+        :param monkeypatch: Installs the probe stub that skips shard 0.
+        """
+        spec = _multi_shard_spec(tmp_path, n=3)
+
+        def _present_only_for_shard_0(uri: str) -> int | None:
+            return 9999 if uri.endswith("shard-000000.h5") else None
+
+        monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _present_only_for_shard_0)
+
+        generate(spec)
+
+        info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list]
+        speed_lines = [m for m in info_messages if "generation speed:" in m]
+        assert len(speed_lines) == 1, f"expected one speed line, got: {info_messages}"
+        expected_samples = 2 * spec.render.samples_per_shard
+        assert f"{expected_samples} samples" in speed_lines[0]
+        assert "samples/s" in speed_lines[0]
+
     def test_run_probe_failure_propagates(
         self,
         patched_subprocess: MagicMock,
