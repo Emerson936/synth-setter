@@ -1657,17 +1657,15 @@ class TestMainSpecPersistence:
         assert isinstance(spec, DatasetSpec)
         assert sky_cfg.extra_envs[WORKER_SPEC_URI_ENV] == spec.r2.input_spec_uri()  # type: ignore[attr-defined]
 
-    def test_main_emits_spec_uri_sentinel(
+    def test_main_does_not_emit_spec_uri_sentinel(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """``main()`` prints ``::synth-setter-spec-uri::<uri>`` before dispatching.
+        """``main()`` must not print the ``::synth-setter-spec-uri::`` marker on stdout.
 
-        The CI workflow greps the tee'd ``generate.log`` for this marker; the
-        sentinel must emit on the launcher host (not the worker) so it shows
-        up before any rank boots.
+        CI derives the URI via ``synth-setter-spec-uri`` (Hydra-compose) — see #1154.
 
         :param monkeypatch: Pytest fixture used to patch ``sys.argv`` + dispatch.
         :param tmp_path: Pytest fixture providing a fresh test directory.
@@ -1682,8 +1680,7 @@ class TestMainSpecPersistence:
 
         gd.main()
 
-        out = capsys.readouterr().out
-        assert "::synth-setter-spec-uri::r2://" in out
+        assert "::synth-setter-spec-uri::" not in capsys.readouterr().out
 
     def test_generate_dataset_pins_smoke_job_name(
         self,

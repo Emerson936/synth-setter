@@ -19,12 +19,14 @@ name: Test Dataset Generation
 # captures the script's stdout via `subprocess.run(capture_output=True)` so a
 # `tee`'d caller workflow can't leak secrets.
 #
-# Stage handoff is via R2: each generate job writes the canonical
-# under-prefix copy at `r2://<bucket>/<prefix>input_spec.json` (the spec's
-# own self-described URI, emitted by `synth-setter-spec-uri`). The validate
-# job below consumes `needs.generate-launcher.outputs.spec_uri`. The
-# run-metadata artifact upload remains for debugging, but it's no longer
-# load-bearing.
+# Stage handoff is via R2: each generate cell writes the canonical
+# under-prefix copy at `r2://<bucket>/<prefix>input_spec.json`. The validate
+# job below indexes `needs.setup.outputs.spec_uris` — a JSON map keyed by
+# `<provider>-<output_format>` that the `setup` job populates by calling
+# `synth-setter-spec-uri --from-experiment ... --run-id-override ...` once
+# per cell. Routing through the non-matrix `setup` output sidesteps the
+# `needs.<matrix-job>.outputs.<x>` scalar collapse (#1154). The run-metadata
+# artifact upload remains for debugging, but it's no longer load-bearing.
 #
 # Provider matrix policy (computed in the `setup` job):
 #   * schedule (hourly `0 * * * *`)    → skypilot-local × {hdf5, wds}.
@@ -142,26 +144,28 @@ jobs:
   #
   # Empty array → downstream matrices skip naturally; no `has_jobs` flag.
   setup:
-    name: Compute provider list + R2 bucket
+    name: Compute provider list + R2 bucket + per-cell spec_uri map
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       providers: ${{ steps.matrix.outputs.providers }}
       output_formats: ${{ steps.matrix.outputs.output_formats }}
       r2_bucket: ${{ steps.bucket.outputs.r2_bucket }}
+      spec_uris: ${{ steps.spec_uris.outputs.spec_uris }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # src/synth_setter/configs/hydra/default.yaml's `defaults` block overrides job_logging /
-      # hydra_logging to `colorlog`, which is provided by the hydra-colorlog
-      # plugin. Without it, Hydra compose fails with:
-      #   MissingConfigException: Could not find 'hydra/job_logging/colorlog'
-      # Pin both to the same versions as [project.dependencies] in pyproject.toml.
-      # Installed before the `matrix` step because that step also composes the
-      # dispatched config to resolve `output_format` on workflow_dispatch.
-      - name: Install Hydra for dataset-config composition
-        run: pip install "hydra-core==1.3.2" "hydra-colorlog==1.2.0"
+      # `--no-deps` keeps torch / skypilot / librosa out of this setup-only env;
+      # the explicit `hydra-core` + `hydra-colorlog` pair matches
+      # `configs/hydra/default.yaml`'s `colorlog` job_logging selector, and the
+      # `pydantic` / `python-dotenv` pair covers `synth-setter-spec-uri`'s
+      # transitive import of `synth_setter.pipeline.schemas.spec`. If the CLI
+      # grows a new top-level dep, add it here — see #25 for tracking drift.
+      - name: Install synth-setter for Hydra compose + spec-uri CLI
+        run: |
+          pip install --no-deps -e .
+          pip install "hydra-core==1.3.2" "hydra-colorlog==1.2.0" "pydantic>=2,<3" python-dotenv
 
       # Provider axis:
       #   schedule, cron `0 * * * *` (hourly) → skypilot-local
@@ -271,6 +275,66 @@ jobs:
           echo "r2_bucket=${R2_BUCKET}" >> "${GITHUB_OUTPUT}"
           echo "r2_bucket: ${R2_BUCKET}"
 
+      # Precompute spec_uri for every (provider, output_format) cell, keyed
+      # `<provider>-<output_format>`. Routing the URI through this non-matrix
+      # output dodges the `needs.<matrix-job>.outputs.<x>` scalar collapse —
+      # see #1154. The per-cell `run_id` formula matches the one
+      # `generate-launcher` passes (#1154 fix is bi-directional). The temp
+      # `rows` file holds one JSON object per cell so a `synth-setter-spec-uri`
+      # failure aborts via `set -e` instead of being swallowed by an enclosing
+      # pipe/command-substitution; the post-loop `jq -sc add` collapses them.
+      - name: Compute per-cell spec_uri map
+        id: spec_uris
+        env:
+          PROVIDERS_JSON: ${{ steps.matrix.outputs.providers }}
+          FORMATS_JSON: ${{ steps.matrix.outputs.output_formats }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_DATASET_CONFIG: ${{ inputs.dataset_config || 'generate_dataset/smoke-shard' }}
+          RUN_ID_BASE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          providers_n=$(printf '%s' "$PROVIDERS_JSON" | jq 'length')
+          formats_n=$(printf '%s' "$FORMATS_JSON" | jq 'length')
+          if [[ "$providers_n" -eq 0 || "$formats_n" -eq 0 ]]; then
+            echo "spec_uris={}" >> "$GITHUB_OUTPUT"
+            echo "spec_uris: {}"
+            exit 0
+          fi
+          rows=$(mktemp)
+          trap 'rm -f "$rows"' EXIT
+          while read -r prov; do
+            while read -r fmt; do
+              if [[ "$EVENT_NAME" == "schedule" ]]; then
+                if [[ "$fmt" == "wds" ]]; then
+                  exp="generate_dataset/smoke-shard-wds"
+                else
+                  exp="generate_dataset/smoke-shard"
+                fi
+              else
+                exp="$DISPATCH_DATASET_CONFIG"
+              fi
+              rid="${RUN_ID_BASE}-${prov}-${fmt}"
+              if ! uri=$(synth-setter-spec-uri --from-experiment "$exp" --run-id-override "$rid"); then
+                echo "::error::synth-setter-spec-uri failed for experiment=${exp} run_id=${rid}"
+                exit 1
+              fi
+              if [[ -z "$uri" ]]; then
+                echo "::error::synth-setter-spec-uri returned empty URI for experiment=${exp} run_id=${rid}"
+                exit 1
+              fi
+              jq -nc --arg k "${prov}-${fmt}" --arg v "$uri" '{($k): $v}' >> "$rows"
+            done < <(printf '%s' "$FORMATS_JSON" | jq -r '.[]')
+          done < <(printf '%s' "$PROVIDERS_JSON" | jq -r '.[]')
+          json=$(jq -sc 'add // {}' < "$rows")
+          actual_n=$(printf '%s' "$json" | jq 'length')
+          expected_n=$(( providers_n * formats_n ))
+          if [[ "$actual_n" -ne "$expected_n" ]]; then
+            echo "::error::spec_uris cardinality mismatch: expected ${expected_n}, got ${actual_n}"
+            exit 1
+          fi
+          echo "spec_uris=$json" >> "$GITHUB_OUTPUT"
+          echo "spec_uris: $json"
+
   # `skypilot-local` / `runpod` / `oci` rows: route through the official
   # launcher reusable. Cluster name includes `github.run_attempt` so re-running
   # a failed job doesn't collide on the launcher's R2 spec key. The
@@ -302,13 +366,19 @@ jobs:
       tail: true
       local: ${{ matrix.provider == 'skypilot-local' }}
       artifact_name: test-run-metadata-${{ matrix.provider }}-${{ matrix.output_format }}
+      run_id: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.provider }}-${{ matrix.output_format }}
     secrets: inherit
 
-  # validate-spec + validate-shard pull the spec from R2 directly via the
-  # canonical `spec_uri` output emitted by `synth-setter-spec-uri`. `if:
-  # !cancelled()` decouples each provider × output_format cell from the OTHER
-  # cells' generate outcomes — RunPod transients won't skip OCI validation,
-  # and an hdf5 failure won't skip wds.
+  # Each validate cell reads its own spec_uri from `needs.setup.outputs.spec_uris`
+  # — a non-matrix JSON map indexed by `<provider>-<output_format>`, populated
+  # by the setup job via `synth-setter-spec-uri --from-experiment ...
+  # --run-id-override ...`. Routing through `needs.setup` (a single non-matrix
+  # job) instead of `needs.generate-launcher` (matrix) sidesteps GHA's
+  # matrix-outputs scalar collapse documented at #1154; per-cell pairing is
+  # restored because each generate cell wrote under the same per-cell run_id
+  # formula. `if: !cancelled()` decouples each cell from the OTHER cells'
+  # generate outcomes — RunPod transients won't skip OCI validation, and an
+  # hdf5 failure won't skip wds.
   validate:
     name: Validate ${{ matrix.provider }} / ${{ matrix.output_format }} dataset
     needs: [setup, generate-launcher]
@@ -321,5 +391,5 @@ jobs:
     uses: ./.github/workflows/validate-dataset-shards.yaml
     with:
       image_tag: ${{ inputs.docker_image_tag || 'dev-snapshot' }}
-      spec_uri: ${{ needs.generate-launcher.outputs.spec_uri }}
+      spec_uri: ${{ fromJSON(needs.setup.outputs.spec_uris)[format('{0}-{1}', matrix.provider, matrix.output_format)] }}
     secrets: inherit

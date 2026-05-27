@@ -93,12 +93,17 @@ on:
         required: false
         type: string
         default: ""
+      run_id:
+        description: "`+run_id=<value>` Hydra override pinned at the launcher. Matrix callers pass `<gh.run_id>-<provider>-<output_format>` so validator cells can re-derive the URI; non-matrix callers can leave empty to auto-pin `<gh.run_id>-<run_attempt>` and avoid retry collisions on R2."
+        required: false
+        type: string
+        default: ""
     outputs:
       spec_uri:
-        description: "Canonical r2:// URI of the materialized spec (under-prefix `input_spec.json`). Consumed by validate-dataset-shards.yaml."
+        description: "Canonical `r2://<bucket>/<prefix>input_spec.json` URI of the materialized spec."
         value: ${{ jobs.generate.outputs.spec_uri }}
       run_id:
-        description: "Generate stage's run_id, parsed from the spec_uri's `data/<task>/<run_id>/` segment. Forwarded to finalize-dataset.yaml for log/artifact naming; finalize loads the run identity from the spec_uri itself."
+        description: "Effective `run_id` (caller-passed or auto-pinned fallback); forwarded to `finalize-dataset.yaml` for log/artifact naming."
         value: ${{ jobs.generate.outputs.run_id }}
   workflow_dispatch:
     inputs:
@@ -148,6 +153,11 @@ on:
         default: "run-metadata"
       hydra_overrides:
         description: "Extra whitespace-separated Hydra `key=value` overrides appended to the launcher invocation (e.g. `render.gui_toggle_cadence=always_on output_format=wds`). Validated against `^[A-Za-z0-9._=,/-]*( [A-Za-z0-9._=,/-]+)*$` — any shell metacharacter fails the workflow because the docker row expands the variable unquoted inside the worker container."
+        required: false
+        type: string
+        default: ""
+      run_id:
+        description: "`+run_id=<value>` Hydra override; empty auto-pins `<gh.run_id>-<run_attempt>` so retries don't collide on R2."
         required: false
         type: string
         default: ""
@@ -408,6 +418,7 @@ jobs:
           INPUT_TAIL: ${{ inputs.tail }}
           INPUT_NUM_WORKERS: ${{ inputs.num_workers }}
           INPUT_HYDRA_OVERRIDES: ${{ inputs.hydra_overrides }}
+          INPUT_RUN_ID: ${{ inputs.run_id || format('{0}-{1}', github.run_id, github.run_attempt) }}
           SYNTH_SETTER_CI_MODE: "1"
         run: |
           set -euo pipefail
@@ -430,6 +441,7 @@ jobs:
             read -ra HYDRA_EXTRA <<< "$INPUT_HYDRA_OVERRIDES"
             OVERRIDES+=("${HYDRA_EXTRA[@]}")
           fi
+          OVERRIDES+=("+run_id=$INPUT_RUN_ID")
           synth-setter-generate-dataset "${OVERRIDES[@]}" \
             2>&1 | tee "${RUN_METADATA_DIR}/generate.log"
           shopt -s nullglob
@@ -533,6 +545,7 @@ jobs:
           TAIL_OVERRIDE: ${{ inputs.tail && 'skypilot_launch.tail=true' || '' }}
           LOCAL_OVERRIDE: ${{ inputs.local && 'skypilot_launch.local=true' || '' }}
           HYDRA_OVERRIDES_EXTRA: ${{ inputs.hydra_overrides }}
+          INPUT_RUN_ID: ${{ inputs.run_id || format('{0}-{1}', github.run_id, github.run_attempt) }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -560,6 +573,7 @@ jobs:
             -e TAIL_OVERRIDE \
             -e LOCAL_OVERRIDE \
             -e HYDRA_OVERRIDES_EXTRA \
+            -e INPUT_RUN_ID \
             "${IMAGE}" \
             bash -c '
               set -euo pipefail
@@ -571,7 +585,8 @@ jobs:
                 "skypilot_launch.compute_template=$TEMPLATE" \
                 "skypilot_launch.job_name=$CLUSTER_NAME" \
                 "skypilot_launch.worker_image_tag=$IMAGE_TAG" \
-                $LOCAL_OVERRIDE $NUM_WORKERS_OVERRIDE $TAIL_OVERRIDE $HYDRA_OVERRIDES_EXTRA
+                $LOCAL_OVERRIDE $NUM_WORKERS_OVERRIDE $TAIL_OVERRIDE $HYDRA_OVERRIDES_EXTRA \
+                "+run_id=$INPUT_RUN_ID"
             ' \
             2>&1 | tee "${RUN_METADATA_DIR}/generate.log"
           shopt -s nullglob
@@ -599,31 +614,34 @@ jobs:
           echo "=== Materialized Spec (${PROVIDER}) ==="
           head -20 "${SPEC_PATH}"
 
-      # `synth-setter-generate-dataset` (`src/synth_setter/cli/generate_dataset.py`)
-      # emits the canonical spec URI on a stdout sentinel line after resolving
-      # it; the tee'd generate.log captures it for both skypilot-local and
-      # runpod/oci rows. We grep the marker rather than re-shelling out to the
-      # spec-uri console script (which would require a host-side `pip install
-      # -e .` for the runpod/oci rows whose workers live inside the container).
-      # Marker constant is `_SPEC_URI_STDOUT_SENTINEL` in generate_dataset.py.
-      # `grep || true` keeps a missing marker from exiting the step (grep
-      # returns 1 on no-match; with `set -euo pipefail` an unmasked grep
-      # failure would skip the explicit empty-check below and surface a
-      # confusing pipe-failure instead of the friendly `::error::` message).
-      # Also parses the penultimate path segment of the spec_uri as `run_id`
-      # (per the `data/<task>/<run_id>/input_spec.json` shape `make_r2_prefix`
-      # produces in pipeline/schemas/prefix.py); the chained finalize job
-      # consumes it as a Hydra `run_id=<value>` override so finalize composes
-      # against the same R2 prefix generate wrote.
-      - name: Extract spec_uri from launcher log
+      # Read spec_uri straight off the materialized `SPEC_PATH` — the same
+      # file `write_spec_locally` wrote and `upload_spec` pushed to R2 — so
+      # the output reflects whatever `(experiment, run_id, hydra_overrides)`
+      # the launcher actually composed (not just what we passed). `run_id`
+      # is the URI's penultimate path segment, per the
+      # `data/<task>/<run_id>/input_spec.json` shape `make_r2_prefix`
+      # produces. Runs inside the dev-snapshot image with the workspace
+      # mounted so the host SPEC_PATH translates cleanly to a container path.
+      - name: Resolve spec_uri from materialized spec
         id: spec_uri
+        env:
+          SPEC_PATH: ${{ steps.gen_local.outputs.spec_path || steps.gen_docker.outputs.spec_path }}
         run: |
           set -euo pipefail
-          SPEC_URI=$(grep -m1 -oE '::synth-setter-spec-uri::r2://[^[:space:]]+' \
-            "${RUN_METADATA_DIR}/generate.log" \
-            | sed 's|^::synth-setter-spec-uri::||' || true)
+          rel="${SPEC_PATH#${GITHUB_WORKSPACE}/}"
+          err=$(mktemp)
+          trap 'rm -f "$err"' EXIT
+          if ! SPEC_URI=$(docker run --rm \
+              -v "${GITHUB_WORKSPACE}:/home/build/synth-setter:ro" \
+              "${IMAGE}" \
+              synth-setter-spec-uri "/home/build/synth-setter/${rel}" 2>"$err"); then
+            echo "::error::synth-setter-spec-uri failed to derive URI from ${SPEC_PATH}"
+            cat "$err" >&2 || true
+            exit 1
+          fi
           if [[ -z "${SPEC_URI}" ]]; then
-            echo "::error::launcher did not emit a ::synth-setter-spec-uri:: marker; see generate.log"
+            echo "::error::synth-setter-spec-uri returned an empty URI for ${SPEC_PATH}"
+            cat "$err" >&2 || true
             exit 1
           fi
           RUN_ID=$(printf '%s\n' "${SPEC_URI}" | awk -F/ '{print $(NF-1)}')
