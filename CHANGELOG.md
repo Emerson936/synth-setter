@@ -1,6 +1,21 @@
 # CHANGELOG
 
 
+## v8.12.2 (2026-05-28)
+
+### Bug Fixes
+
+- **data-pipeline**: Default min_loudness to -55 dB
+  ([#1334](https://github.com/tinaudio/synth-setter/pull/1334),
+  [`cbe86b4`](https://github.com/tinaudio/synth-setter/commit/cbe86b47b952225d13c6f4b447827f7d670d7dec))
+
+Raise the production loudness floor from -50.0 to -55.0 dB across the generate_dataset experiment
+  configs, the render config, the MAKE_DATASET_MIN_LOUDNESS constant, and the docs that quote it.
+  The test layer already standardizes on -55 (_MIN_LOUDNESS, _SURGE_FIXTURE_MIN_LOUDNESS); this
+  brings production in line. Deliberately-distinct test fixtures (-inf gate-disable, -40
+  override-propagation, -60 real-render headroom, -30/-1 serialization/repr) are left unchanged.
+
+
 ## v8.12.1 (2026-05-28)
 
 ### Bug Fixes
