@@ -1,6 +1,70 @@
 # CHANGELOG
 
 
+## v8.12.3 (2026-05-28)
+
+### Bug Fixes
+
+- **cli**: Inline oracle eval resumes the generate wandb run
+  ([#1335](https://github.com/tinaudio/synth-setter/pull/1335),
+  [`324a74d`](https://github.com/tinaudio/synth-setter/commit/324a74d436dd86ec9d950e4e35e8bb4abc6c8683))
+
+* test(cli): pin oracle-eval inline shared wandb-run contract (real workflow)
+
+Add a real-workflow, state-verifying integration test that drives `synth-setter-generate-dataset`
+  with oracle_eval_inline=true under WANDB_MODE=offline and asserts the inline oracle eval resumes
+  the generate-phase wandb run id (two offline-run dirs sharing one run_id slug; generate dir
+  carries shard+summary rows, eval dir carries test/* rows).
+
+No mocks: real Surge VST + real R2 + real wandb offline client. The eval's offline run is reached by
+  pinning SYNTH_SETTER_WORKSPACE to the fixture tmp_path, so _run_cli gains `extra_env` and a
+  `timeout` knob (default unchanged for existing callers).
+
+Red by design — the test is committed without the implementation. It also surfaces that the current
+  oracle_eval_inline path is broken end-to-end: the eval subprocess is invoked with `logger=null`,
+  which fails Hydra composition ("Config group override must be a string or a list. Got NoneType").
+  The agreed fix (logger=wandb +logger.wandb.id=<run_id> +logger.wandb.resume=must) both fixes the
+  crash and wires the shared run.
+
+* fix(cli): resume the generate wandb run for inline oracle eval
+
+The oracle_eval_inline path passed logger=null to synth-setter-eval, which crashed Hydra composition
+  (Config group override must be a string or a list. Got NoneType) — the feature's only test mocked
+  subprocess.run so the crash never surfaced. Swap logger=null for logger=wandb plus
+  +logger.wandb.id=<spec.run_id> +logger.wandb.resume=must so the eval resumes the generate phase's
+  run and its test/* metrics land there.
+
+Unmasking that crash exposed two more latent blockers on the real eval path, both fixed here so the
+  round-trip runs end to end: - the surge data config marks predict_file mandatory (???) but
+  mode=test never reads it, so pin data.predict_file=null; - download stats.npz beside the splits
+  (use_saved_mean_and_variance=true loads it from dataset_root) and pin data.batch_size=1 so the
+  smoke-sized test split (4 samples) does not floor to zero batches and skip test_step.
+
+Refs #1331
+
+* docs(wandb): note inline oracle eval resumes the generate run
+
+The generate-run wandb lifecycle in wandb-integration.md §5 did not mention that
+  oracle_eval_inline=true now re-opens the run via resume=must and appends Lightning test/* rows.
+  Add §5f and extend the doc-map covers line so the doc matches the new behavior.
+
+* docs(cli): replace (???) hedge in predict_file comment with config pointer
+
+Point at configs/data/surge*.yaml's mandatory `???` marker instead of hedging, per PR review.
+
+* refactor(cli): drop redundant + from logger.wandb.id eval override
+
+logger/wandb.yaml already declares id: null, so the eval subprocess argv can override it with a
+  plain logger.wandb.id=<run_id>; the + (append) operator is only needed for logger.wandb.resume,
+  which is absent from that config. Keeps the two override forms honest.
+
+* chore(lint): satisfy docformatter + pydoclint on touched docstrings
+
+Shorten _download_finalized_splits summary so it stays on one physical line (docformatter wrapped
+  it, which then tripped ruff D205), and document the run_dir param + return on _single_wandb_binary
+  for pydoclint DOC103.
+
+
 ## v8.12.2 (2026-05-28)
 
 ### Bug Fixes
