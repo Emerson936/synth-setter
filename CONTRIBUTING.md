@@ -15,8 +15,6 @@ For detailed internal standards (aimed at AI-assisted development), see
 - **make** (GNU Make)
 - **pre-commit** (`pip install pre-commit`)
 - **Git**
-- **[bats](https://github.com/bats-core/bats-core)** (optional, for shell tests:
-  `brew install bats-core` on macOS or `apt-get install bats` on Debian/Ubuntu)
 
 ### Clone and install
 
@@ -146,7 +144,6 @@ make test-full-cpu  # all CPU tests (slow + requires_vst included; gpu/mps exclu
 make test-full-gpu  # GPU + CPU tests (mps excluded). Serial — exclusive GPU access
 make test-full-mps  # MPS + CPU tests (gpu excluded). Serial — exclusive MPS access
 make test-vst-cpu   # VST-only suite (requires_vst, slow included; gpu/mps excluded)
-make test-bats      # BATS shell tests (requires bats — see Prerequisites)
 make coverage       # tests with coverage report (HTML + terminal)
 make benchmark      # performance benchmarks
 ```
