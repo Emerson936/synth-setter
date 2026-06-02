@@ -99,7 +99,7 @@ def _run_oracle_eval_subprocess(dataset_root: Path, run_id: str) -> None:
 
     :param dataset_root: Holds the finalized HDF5 splits the eval datamodule reads.
     :param run_id: Canonical ``spec.run_id``; the eval resumes this wandb run
-        so its ``test/*`` metrics land on the generate phase's run.
+        so its ``audio/*`` metrics land on the generate phase's run.
     """
     argv = [
         sys.executable,
@@ -110,19 +110,19 @@ def _run_oracle_eval_subprocess(dataset_root: Path, run_id: str) -> None:
         f"hydra.run.dir={dataset_root}",
         "ckpt_path=null",
         "logger=wandb",
+        # eval.yaml defaults render to null; render_vst=true re-renders the
+        # predicted params, so select the surge_simple group the smoke shard
+        # was generated with (param spec + preset must match the dataset).
+        "render=surge_simple",
         # id already exists in logger/wandb.yaml (id: null) so a plain
         # override suffices; resume is absent there and needs +append.
         f"logger.wandb.id={run_id}",
         "+logger.wandb.resume=must",
-        # configs/data/surge*.yaml marks predict_file a mandatory `???` value;
-        # mode=test never reads it, so null satisfies the resolver instead of
-        # raising MissingMandatoryValue at datamodule instantiation — see #1331.
-        "data.predict_file=null",
         # SurgeXTDataset floors len to samples // batch_size; the 128 default
         # would yield zero batches on the smoke-sized test split (4 samples),
-        # so test_step never runs and no test/* metric is logged — see #1331.
+        # so predict_step never runs and no audio/* metric is logged — see #1331.
         "data.batch_size=1",
-        "mode=test",
+        "mode=predict",
     ]
     logger.info(f"oracle_eval_inline subprocess: {argv}")
     subprocess.run(argv, check=True, timeout=_ORACLE_EVAL_TIMEOUT_SECONDS)  # noqa: S603
@@ -603,15 +603,17 @@ def _render_and_upload_shard(
 def spec_from_cfg(cfg: DictConfig) -> DatasetSpec:
     """Build a DatasetSpec from a Hydra-composed cfg.
 
-    Resolves all interpolations, drops the non-DatasetSpec sub-trees, and constructs the model.
-    Raises if the composed config is not a mapping.
+    Drops the non-DatasetSpec sub-trees *before* resolving so their
+    interpolations are never evaluated: the spec never reads them, and they may
+    reference resolvers only available under ``@hydra.main`` (e.g. ``data``'s
+    ``dataset_root: ${hydra:runtime.output_dir}/data``). Raises if the composed
+    config is not a mapping.
     """
-    raw: object = OmegaConf.to_container(cfg, resolve=True)
+    spec_keys = [k for k in cfg if isinstance(k, str) and k not in _NON_SPEC_KEYS]
+    raw: object = OmegaConf.to_container(OmegaConf.masked_copy(cfg, spec_keys), resolve=True)
     if not isinstance(raw, dict):
         raise TypeError(f"composed config is not a mapping: {type(raw).__name__}")
-    spec_kwargs: dict[str, Any] = {
-        k: v for k, v in raw.items() if isinstance(k, str) and k not in _NON_SPEC_KEYS
-    }
+    spec_kwargs: dict[str, Any] = {k: v for k, v in raw.items() if isinstance(k, str)}
     return DatasetSpec(**spec_kwargs)
 
 
