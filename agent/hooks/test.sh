@@ -1069,6 +1069,7 @@ T_worktree_guard_warns_in_primary() {
   [[ "$(last_exit_line "$out")" == "EXIT:0" ]] || { echo "expected EXIT:0, got: $out"; return 1; }
   grep -q "WARNING" "$stderr_file" || { echo "stderr should contain WARNING; got: $(cat "$stderr_file")"; return 1; }
   grep -q "git worktree add" "$stderr_file" || { echo "stderr should suggest 'git worktree add'"; return 1; }
+  grep -q "make link-plugins" "$stderr_file" || { echo "remediation should chain 'make link-plugins' so the new worktree gets the VST symlink; got: $(cat "$stderr_file")"; return 1; }
 }
 it "worktree-guard: edit in primary (warn mode default) → exit 0 with WARNING + remediation on stderr" T_worktree_guard_warns_in_primary
 
@@ -1186,7 +1187,7 @@ T_worktree_guard_remediation_path_is_absolute_from_subdir() {
   out=$(cd "$subdir" && echo '' | bash "$SANDBOX/agent/hooks/worktree-guard.sh" 2>"$stderr_file"; echo "EXIT:$?")
   [[ "$(last_exit_line "$out")" == "EXIT:0" ]] || { echo "expected EXIT:0, got: $out"; return 1; }
   grep -q "WARNING" "$stderr_file" || { echo "subdir cwd should still WARN; got: $(cat "$stderr_file")"; return 1; }
-  grep -qE "git worktree add --detach ${SANDBOX}/\\.claude/worktrees/" "$stderr_file" || {
+  grep -qE "git worktree add --detach '${SANDBOX}/\\.claude/worktrees/[^']+'" "$stderr_file" || {
     echo "remediation must anchor at \$primary_root (${SANDBOX}); got: $(cat "$stderr_file")"
     return 1
   }
@@ -1208,6 +1209,7 @@ T_session_start_banner_in_primary() {
   [[ "$(last_exit_line "$out")" == "EXIT:0" ]] || { echo "expected EXIT:0, got: $out"; return 1; }
   [[ "$out" == *"PRIMARY CHECKOUT"* ]] || { echo "banner should flag PRIMARY CHECKOUT; got: $out"; return 1; }
   [[ "$out" == *"git worktree add"* ]] || { echo "banner should suggest 'git worktree add'; got: $out"; return 1; }
+  [[ "$out" == *"make link-plugins"* ]] || { echo "spawn command should chain 'make link-plugins' so the new worktree gets the VST symlink; got: $out"; return 1; }
 }
 it "session-start-banner: in primary → stdout flags PRIMARY CHECKOUT and shows remediation" T_session_start_banner_in_primary
 
@@ -1271,7 +1273,7 @@ T_session_start_banner_remediation_path_is_absolute_from_subdir() {
   out=$(cd "$subdir" && bash "$SANDBOX/agent/hooks/session-start-cwd-banner.sh" </dev/null 2>&1; echo "EXIT:$?")
   [[ "$(last_exit_line "$out")" == "EXIT:0" ]] || { echo "expected EXIT:0, got: $out"; return 1; }
   [[ "$out" == *"PRIMARY CHECKOUT"* ]] || { echo "subdir cwd should still flag PRIMARY; got: $out"; return 1; }
-  echo "$out" | grep -qE "git worktree add --detach ${SANDBOX}/\\.claude/worktrees/" || {
+  echo "$out" | grep -qE "git worktree add --detach '${SANDBOX}/\\.claude/worktrees/[^']+'" || {
     echo "remediation must anchor at \$primary_root (${SANDBOX}); got: $out"
     return 1
   }
