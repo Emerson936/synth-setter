@@ -64,10 +64,10 @@ def test_evaluate_runs_oracle_with_null_ckpt_path(
         cfg.paths.root_dir = str(operator_workspace())
         cfg.paths.output_dir = str(tmp_path)
         cfg.paths.log_dir = str(tmp_path)
-        cfg.data.dataset_root = str(surge_xt_smoke_datasets)
-        cfg.data.predict_file = str(surge_xt_smoke_datasets / "test.h5")
-        cfg.data.batch_size = 1
-        cfg.data.num_workers = 0
+        cfg.datamodule.dataset_root = str(surge_xt_smoke_datasets)
+        cfg.datamodule.predict_file = str(surge_xt_smoke_datasets / "test.h5")
+        cfg.datamodule.batch_size = 1
+        cfg.datamodule.num_workers = 0
         cfg.ckpt_path = None
 
     HydraConfig().set_config(cfg)
@@ -161,11 +161,11 @@ def test_eval_cli_downloads_dataset_from_r2_then_scores_oracle(
             "hydra.job.chdir=false",
             f"model.net.d_out={len(param_specs['surge_4'])}",
             "callbacks.log_per_param_mse.param_spec=surge_4",
-            "data.download_dataset_root_uri=r2://intermediate-data/dataset",
-            f"data.dataset_root={dataset_root}",
-            f"data.predict_file={dataset_root}/test.h5",
-            "data.batch_size=1",
-            "data.num_workers=0",
+            "datamodule.download_dataset_root_uri=r2://intermediate-data/dataset",
+            f"datamodule.dataset_root={dataset_root}",
+            f"datamodule.predict_file={dataset_root}/test.h5",
+            "datamodule.batch_size=1",
+            "datamodule.num_workers=0",
             "ckpt_path=null",
             f"paths.output_dir={output_dir}",
             f"hydra.run.dir={output_dir}",
