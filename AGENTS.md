@@ -134,7 +134,11 @@ unintended shell expansion. A `PreToolUse` hook
   The encoded SHA must be an ancestor of HEAD and within `REVIEW_MAX_LAG`
   (default 2) first-parent commits of it — merges from main count as one
   commit, not the dozens they bring in. Set `REVIEW_MAX_LAG=N` for a
-  justified larger gap.
+  justified larger gap. The gate also **blocks while the sentinel still lists
+  `[comment-hygiene:warn|block]` findings** (`REVIEW_COMMENT_GATE`: `block` default /
+  `warn` / `off`). Run `/fix-review-comments` to apply the findings' rewrites,
+  commit, and re-review in one pass; set `REVIEW_COMMENT_GATE=off` only for a
+  finding you've judged intentional.
 - **Readiness gates:** CI green ∧ `mergeable=MERGEABLE` ∧ every review
   comment has an inline reply ∧ no fresh Copilot findings — see
   `/pr-preflight`.
@@ -176,6 +180,8 @@ Local skills wrap the review workflow:
 - `/repo-review-full` (parallel agents, posts inline review comments).
 - `/repo-review-full-no-comments` (same fan-out, renders to chat — pre-PR
   gate uses this).
+- `/fix-review-comments` (applies the sentinel's comment-hygiene findings,
+  commits, and re-reviews — the remediation half of the pre-PR comment gate).
 
 See [`agent/skills/repo-review/SKILL.md`](agent/skills/repo-review/SKILL.md)
 and the shared analysis in
