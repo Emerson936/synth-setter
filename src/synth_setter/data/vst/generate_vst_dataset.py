@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import h5py
 import hdf5plugin
@@ -12,7 +12,7 @@ from pydantic_settings import BaseSettings, CliApp, CliPositionalArg, SettingsCo
 from pyloudnorm import Meter
 
 from synth_setter.data.vst.core import render_params
-from synth_setter.data.vst.param_spec import ParamSpec
+from synth_setter.data.vst.param_spec import NoteParams, ParamSpec
 from synth_setter.data.vst.shapes import (
     AUDIO_FIELD,
     MEL_N_MELS,
@@ -34,7 +34,7 @@ from synth_setter.pipeline.schemas.spec import (
 @dataclass
 class VSTDataSample:
     synth_params: dict[str, float]
-    note_params: dict[str, float]
+    note_params: NoteParams
 
     sample_rate: float
     channels: int
@@ -74,7 +74,7 @@ def generate_sample(
     param_spec: ParamSpec,
     preset_path: str,
     fixed_synth_params: dict[str, float] | None = None,
-    fixed_note_params: dict[str, int | tuple[float, float]] | None = None,
+    fixed_note_params: NoteParams | None = None,
     *,
     plugin: VST3Plugin | None = None,
     warmup: bool = False,
@@ -239,7 +239,7 @@ def create_datasets_and_get_start_idx(
 def fixed_params_from_dataset(
     source_shard: Path | str,
     param_spec: ParamSpec,
-) -> tuple[list[dict[str, float]], list[dict[str, int | tuple[float, float]]]]:
+) -> tuple[list[dict[str, float]], list[NoteParams]]:
     """Decode an existing shard's ``param_array`` into fixed synth/note param lists.
 
     Reads the ``param_array`` dataset from ``source_shard`` and decodes each row
@@ -275,11 +275,13 @@ def fixed_params_from_dataset(
             "param_spec_name (same encoding width)."
         )
     synth_params_list: list[dict[str, float]] = []
-    note_params_list: list[dict[str, int | tuple[float, float]]] = []
+    note_params_list: list[NoteParams] = []
     for row in param_array:
         synth_params, note_params = param_spec.decode(row)
         synth_params_list.append(synth_params)
-        note_params_list.append(note_params)
+        # decode is annotated dict[str, float]; pitch is int and note_start_and_end
+        # a tuple at runtime, matching NoteParams' closed shape.
+        note_params_list.append(cast(NoteParams, note_params))
     return synth_params_list, note_params_list
 
 
