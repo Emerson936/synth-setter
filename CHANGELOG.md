@@ -1,6 +1,216 @@
 # CHANGELOG
 
 
+## v8.30.0 (2026-06-06)
+
+### Build System
+
+- **tart**: Bring macOS dev VM to parity with devcontainer-tools
+  ([#1537](https://github.com/tinaudio/synth-setter/pull/1537),
+  [`2ce258d`](https://github.com/tinaudio/synth-setter/commit/2ce258d9f6181945c9ec76129e189f54c5d1a005))
+
+* build(tart): bring macOS dev VM to parity with devcontainer-tools
+
+Refs #1008. The Tart Packer template was last updated to track Docker's dev image at #1008 (May
+  2026); since then the devcontainer-tools stage has added Codex CLI + Antigravity + zellij (#1355),
+  set diagnostic and allocator env defaults (#1483), pointed WANDB_DATA_DIR at a writable .cache
+  path (#1424), and flipped install onto uv sync --frozen (#1267). Bring the macOS image into
+  parity:
+
+- Install tmux, zellij (brew), node (for npm), Codex CLI (npm install -g @openai/codex@<version>),
+  and Antigravity's agy binary (curl-installed). Add a codex_version variable mirroring the
+  Dockerfile's CODEX_VERSION arg. - Switch the deps install from uv pip install --torch-backend
+  ${torch_backend} -e ".[torch,dev]" to uv sync --frozen — same path test-mps.yml uses on Apple
+  Silicon, with torch resolving to PyPI's MPS-capable wheel via [tool.uv.sources] sys_platform
+  markers. The torch_backend variable was only used by the dropped install line, so remove it. -
+  Export HYDRA_FULL_ERROR, PYTHONDONTWRITEBYTECODE, PYTHONFAULTHANDLER, PYTHONUNBUFFERED, and
+  WANDB_DATA_DIR=HOME/.cache/wandb from ~/.zprofile — parity with the python-base /
+  devcontainer-tools ENV block. PYTORCH_CUDA_ALLOC_CONF is omitted: macOS runs on MPS, not CUDA. -
+  Fix the Surge XT smoke-test import: the package was nested under src/synth_setter/ in #991, so
+  'from src.data.vst.core' no longer resolves. Switch to 'from synth_setter.data.vst.core' — same
+  path test-mps.yml's mirrored smoke check uses.
+
+* docs(tart): sync getting-started + doc-map with parity refresh
+
+Doc-drift surface after the macos.pkr.hcl parity refresh:
+
+- docs/doc-map.yaml — the `tart/**` covers entry listed `torch_backend` among the user-overridable
+  packer vars. That variable was removed in the parity refresh (its only consumer was the dropped
+  `uv pip install --torch-backend …` line). Replaced with `codex_version` and extended the prose to
+  mention `uv sync --frozen`, the new brew packages (tmux, zellij, node), the Codex CLI +
+  Antigravity installs, and the new ~/.zprofile env defaults. - docs/getting-started.md — three
+  drifted spots: - The "CPU torch wheels — Tart VMs have no GPU" rationale belonged to the dropped
+  `torch_backend=cpu` install. macOS now resolves torch from PyPI's MPS-capable wheel via
+  `[tool.uv.sources]` sys_platform markers; reworded the venv-contents sentence to match. - The
+  "different torch backend" custom-build motivation no longer applies; swapped with "pinned Codex
+  CLI version" via the new `codex_version` var. - The user-overridable packer-vars enumeration still
+  listed `torch_backend (default cpu)` and did not list `codex_version`; removed the former and
+  added the latter.
+
+Refs #599
+
+* fix(tart): leading newline in zprofile env-default printf appenders
+
+Copilot flagged on PR #1537: the printf appenders for PYTHONDONTWRITEBYTECODE / PYTHONFAULTHANDLER /
+  PYTHONUNBUFFERED / WANDB_DATA_DIR each emitted `export VAR=…\n` without a leading newline, unlike
+  the HYDRA_FULL_ERROR appender right above (and the established PATH / .venv-activate pattern at
+  lines 108 and 162). In the normal sequential case the previous appender's trailing `\n` keeps
+  lines separated, but a partial-state re-provisioning where the grep guard short-circuits for
+  HYDRA_FULL_ERROR (and that match doesn't end with a newline) would concatenate the next export
+  onto the same line and break zsh parsing.
+
+Add a leading `\n` to all four appenders so each export is guaranteed to start on a fresh line
+  regardless of the prior file state.
+
+Adversarial verification (under zsh, with a synthetic ~/.zprofile that ends with `export
+  HYDRA_FULL_ERROR=1` and no trailing newline) confirms each subsequent export lands on its own line
+  and all five vars source successfully.
+
+* ci(tart): build & push Tart macOS VM image on dispatch + PR-presubmit
+
+Adds `.github/workflows/tart-image-build.yml`, a presubmit + publish lane for the macOS dev VM image
+  declared in `tart/macos.pkr.hcl`. Mirrors the docker-build-validation split: PRs validate the
+  Packer template by running `packer build` end-to-end (no push); workflow_dispatch runs `packer
+  build` followed by `tart push` to Docker Hub.
+
+- Triggers: `workflow_dispatch` (with `synth_setter_git_ref` + `push_latest` inputs) and
+  `pull_request` filtered to `tart/macos.pkr.hcl` and the workflow file itself. Pinning the trigger
+  to the template keeps the ~45-60 min macOS-runner build out of unrelated PRs. - Runner:
+  `macos-latest` (Apple Silicon since Nov 2024). Tart needs Apple's Virtualization.framework, which
+  is macOS-only and ARM-only. - Build: brew-installs `cirruslabs/cli/tart` + `hashicorp/tap/packer`,
+  runs `packer init/validate/build` from the `tart/` directory, baking the workflow's triggering SHA
+  (or the dispatch-input ref) into the VM. - Push (dispatch only): `tart login registry-1.docker.io`
+  via stdin-fed `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets, then a single `tart push` carrying
+  both the immutable dated tag and `:latest` (toggleable via `push_latest` input). PR runs never
+  reach this step so a contributor change cannot redirect `:latest`. - Cleanup: `tart delete` the
+  local VM in `if: always()` to release the ~30 GB image before runner teardown. - Permissions:
+  `contents: read` only — no `packages: write` is needed for Docker Hub, and PRs hit no
+  secret-bearing steps.
+
+Refs #599 (the tart-template upkeep tracker).
+
+* ci(tart): pass PACKER_GITHUB_API_TOKEN so packer init clears rate-limit
+
+`packer init` queries github.com/cirruslabs/packer-plugin-tart's tag list to resolve the version
+  constraint. Unauthenticated that draws from the 60/hr anonymous pool shared across the entire GHA
+  macOS runner IP, which tripped on the first run of this workflow:
+
+GET .../tags: 403 API rate limit exceeded for 13.105.117.127 HINT: Set the PACKER_GITHUB_API_TOKEN
+  env var with a token to get more requests.
+
+The job's default GITHUB_TOKEN suffices (public-repo read only); pass it on the `packer init` step.
+
+* ci(tart): split into validate (PR) + build-and-push (dispatch)
+
+First run on PR #1537 hit a hard infra limit: GHA's standard `macos-latest` runners are themselves
+  nested Apple VMs and refuse to expose Apple's Virtualization.framework to Tart, producing
+
+==> tart-cli.tart: Error: Invalid virtual machine configuration. Virtualization is not available
+
+after ~90s into `packer build`. The publish path therefore cannot run on free GHA hosted runners;
+  only the larger-runner tier (`macos-15-xlarge`, which documents nested-virt support) or a
+  self-hosted Apple Silicon runner can host the build.
+
+Restructured the workflow into two jobs to keep PR presubmit cheap and reliable while preserving the
+  dispatch publish lane:
+
+- `validate` (PR + push-to-main + dispatch precondition): runs `packer fmt -check && packer init &&
+  packer validate` on `macos-latest` in ~3-5 min. Catches HCL syntax / variable / plugin-resolution
+  drift before it can land. This is the PR-presubmit gate. - `build_and_push` (`workflow_dispatch`
+  only, `needs: validate`): runs `packer build` + `tart login` + `tart push` on `macos-15-xlarge`.
+  The runner-tier requirement is called out in an inline comment so whoever dispatches knows the
+  org's larger-runner plan must include that label; if it doesn't, the job queues and the operator
+  can swap to `cirruslabs/runner` or a self-hosted target without touching the rest of the workflow.
+
+Added a `push` trigger on main with the same path filter so a merge also re-validates; the build job
+  stays gated to dispatch since automatic publishes from main would compete with the manual
+  publishing recipe documented at the bottom of `tart/macos.pkr.hcl`.
+
+* fix(tart): address three Copilot findings — MPS routing, base_image_digest, vm_name
+
+Three legit Copilot inline findings on PR #1537, all valid:
+
+- `docs/getting-started.md` claimed macOS resolves the MPS torch wheel *via* `[tool.uv.sources]`
+  `sys_platform` markers. The markers actually match Linux/Windows only — macOS (`sys_platform ==
+  'darwin'`) hits no marker and falls through to PyPI's default index. Reworded so the routing is
+  described accurately (PyPI's default *because* nothing matches, not *via* a marker). -
+  `docs/doc-map.yaml` listed every packer var except `base_image_digest`. That variable pins the
+  cirruslabs base-image digest the VM clones from, and changing it is one of the documented
+  custom-build motivations in `docs/getting-started.md`. Added to the covers entry so doc-drift
+  sweeps catch future drift on it. - `.github/workflows/tart-image-build.yml` hard-coded `VM_NAME`
+  in env but did not pass it to `packer build`, so a future bump of `tart/macos.pkr.hcl`'s `vm_name`
+  default would silently desync the workflow's `tart push` / `tart delete` from the actual VM. Pass
+  `-var "vm_name=${VM_NAME}"` so the workflow's env is the single source of truth.
+
+* build(tart): drop the tart-image-build GHA workflow
+
+The macOS VM image is validated and published via the local tart/build.sh helper (#1540); the GHA
+  workflow's build job can't run anyway — GitHub's macos runners are nested VMs that refuse to
+  expose Virtualization.framework to packer build. Drop the workflow rather than carry a
+  validate-only gate that duplicates build.sh.
+
+### Features
+
+- **data-pipeline**: Copy_dataset_root_uri accepts file:// and r2://
+  ([#1548](https://github.com/tinaudio/synth-setter/pull/1548),
+  [`f173853`](https://github.com/tinaudio/synth-setter/commit/f17385333363c70f623179d140415c1efa8f3c5d))
+
+* feat(data-pipeline): copy_dataset_root_uri accepts file:// and r2://
+
+Rename the dataset-copy source field `copy_dataset_root` to `copy_dataset_root_uri` and widen it
+  from a worker-local directory to a root URI (bare path, `file://`, or `r2://`). An `r2://` source
+  shard is downloaded to a tempfile per shard at copy time, so the source no longer has to be synced
+  locally before a copy run. This is the generate-side sibling of the finalize change in #1542
+  (run-prefix URIs end to end).
+
+The launch-time preflight (`_validate_copy_source`) now loads the source `input_spec.json` through
+  `load_spec_from_uri`, so an `r2://` source spec is validated without a local sync.
+
+Back-compat: the `mode="before"` shim promotes both pre-rename shapes to `copy_dataset_root_uri` —
+  the flat `copy_dataset_root` and the older nested `datasetsrc: {copy_dataset_root: …}` — and
+  `from_hydra_cfg` rejects either stale Hydra key with a migration pointer.
+
+* internal-fix(data-pipeline): surface rclone failures distinctly in copy preflight
+
+Address review feedback on PR #1548.
+
+- generate_dataset._validate_copy_source: split the source-spec load except into a FileNotFoundError
+  arm (genuinely-missing spec -> "sync the spec") and a subprocess.CalledProcessError arm (r2://
+  rclone fetch failure -> names the failing command + exit code, points at auth/network/config).
+  Conflating them misdirected operators on an object-store access fault (Copilot; code-health;
+  ml-pipeline). Reuse spec_io.load_spec_from_root for the root->input_spec.json join instead of
+  re-implementing it (code-health DRY). - r2_io.download_to_path: add
+  -vv/--contimeout=30s/--timeout=300s/--retries=3 to match the sibling upload/dir helpers, so the
+  per-shard r2:// copy-source fetch on the renderer hot path retries a transient blip instead of
+  failing the render outright (synth-setter; ml-test).
+
+Tests: - TestValidateCopySource: rename _raises_with_path -> _raises_with_root_uri and assert on the
+  root URI; add an r2:// case stubbing rclone to exit non-zero, asserting the distinct
+  object-store-access ValueError and chained cause. - TestDownloadToPath: pin the rclone
+  reliability-flag set (argv assertion). - TestLocalizedUri: assert the r2 tempfile is removed when
+  the with-body raises, and that a malformed file:// host is rejected with ValueError.
+
+Deferred (justified inline): migrating the r2 tests to the fake_r2_remote fixture, and an existence
+  check inside localized_uri for bare/file:// paths.
+
+* internal-fix(data-pipeline): dedupe URI join, name output_format/malformed-spec mismatches
+
+Builds on the preflight error-handling split in 6f49f70e:
+
+- Extract `spec_io.join_uri(root, name)` to centralize trailing-slash normalization; route
+  `load_spec_from_root` and the per-shard copy-source fetch (`generate_vst_dataset`) through it so
+  both compose root + basename identically (4 reviewers flagged the duplicated `rstrip('/')` idiom).
+  - `_validate_copy_source` adds a `ValidationError` arm so a malformed/stale source
+  `input_spec.json` reports clearly instead of leaking a raw pydantic error (ml-pipeline). -
+  `validate_copy_source` names an `output_format` mismatch directly rather than only surfacing the
+  derived `.tar` vs `.h5` shard-filename diff (ml-pipeline). - Tighten
+  `fixed_params_from_dataset(source_shard)` to `Path` — the only caller is `localized_uri`, which
+  always yields a `Path` (python-style).
+
+Tests: `join_uri` trailing-slash normalization, a malformed-spec preflight arm, a direct
+  output_format mismatch, and an assertion that the r2 download targets the joined URI.
+
+
 ## v8.29.0 (2026-06-06)
 
 ### Features
