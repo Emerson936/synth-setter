@@ -25,6 +25,9 @@ from synth_setter.cli.eval import (
 _FAKE_WRAPPER = "/fake/vst-headless-wrapper"
 
 _AGGREGATED_METRICS_CSV = ",mean,std\nmss,0.5,0.1\nwmfcc,0.3,0.05\nsot,0.2,0.02\nrms,0.9,0.01\n"
+_AGGREGATED_METRICS_SHUFFLED_CSV = (
+    ",mean,std\nmss,0.6,0.12\nwmfcc,0.35,0.06\nsot,0.25,0.025\nrms,0.85,0.015\n"
+)
 
 _EXPECTED_AUDIO_METRICS = {
     "audio/mss_mean": pytest.approx(0.5),
@@ -45,7 +48,6 @@ def _build_postprocess_cfg(
     compute_metrics: bool = True,
     rerender_target: bool = True,
     num_workers: int = 1,
-    shuffle_pred_audio: bool = False,
     shuffle_seed: int = 0,
     render: dict[str, Any] | None = None,
 ) -> DictConfig:
@@ -57,7 +59,6 @@ def _build_postprocess_cfg(
     :param compute_metrics: Drives ``cfg.evaluation.compute_metrics``.
     :param rerender_target: Drives ``cfg.evaluation.rerender_target``.
     :param num_workers: Drives ``cfg.evaluation.num_workers``.
-    :param shuffle_pred_audio: Drives ``cfg.evaluation.shuffle_pred_audio``.
     :param shuffle_seed: Drives ``cfg.evaluation.shuffle_seed``.
     :param render: Drives ``cfg.render``; pass ``None`` to test the unset-render branch.
     :returns: Minimal :class:`DictConfig` shaped the way the helper reads it.
@@ -70,7 +71,6 @@ def _build_postprocess_cfg(
                 "compute_metrics": compute_metrics,
                 "rerender_target": rerender_target,
                 "num_workers": num_workers,
-                "shuffle_pred_audio": shuffle_pred_audio,
                 "shuffle_seed": shuffle_seed,
             },
             "render": render,
@@ -336,15 +336,17 @@ def test_postprocessing_metrics_argv_includes_num_workers(
         "-m",
         "synth_setter.evaluation.compute_audio_metrics",
     ]
-    assert metrics_argv[-2:] == ["-w", "4"]
+    assert "-w" in metrics_argv
+    w_idx = metrics_argv.index("-w")
+    assert metrics_argv[w_idx + 1] == "4"
 
 
-def test_postprocessing_forwards_shuffle_flags_to_metrics_subprocess(
+def test_postprocessing_always_forwards_shuffle_seed_to_metrics_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     predictions_tree: Path,
     captured_argv: list[list[str]],
 ) -> None:
-    """``shuffle_pred_audio`` forwards ``--shuffle_pred_audio``/``--shuffle_seed`` to metrics.
+    """``--shuffle_seed`` is always forwarded so callers control the permutation seed.
 
     :param monkeypatch: Pins ``sys.platform`` to ``darwin`` so the metrics-only argv is asserted.
     :param predictions_tree: ``tmp_path`` with ``predictions/`` + ``audio/`` pre-created.
@@ -355,49 +357,44 @@ def test_postprocessing_forwards_shuffle_flags_to_metrics_subprocess(
         predictions_tree,
         render_vst=False,
         compute_metrics=True,
-        shuffle_pred_audio=True,
         shuffle_seed=7,
     )
 
     _run_predict_postprocessing(cfg)
 
     metrics_argv = captured_argv[0]
-    assert "--shuffle_pred_audio" in metrics_argv
+    assert "--shuffle_seed" in metrics_argv
     seed_idx = metrics_argv.index("--shuffle_seed")
     assert metrics_argv[seed_idx + 1] == "7"
 
 
-def test_postprocessing_omits_shuffle_flags_when_disabled(
+def test_postprocessing_forwards_default_shuffle_seed_zero(
     monkeypatch: pytest.MonkeyPatch,
     predictions_tree: Path,
     captured_argv: list[list[str]],
 ) -> None:
-    """With ``shuffle_pred_audio`` off, neither shuffle flag reaches the metrics argv.
+    """Default ``shuffle_seed=0`` is forwarded so the probe is reproducible without config.
 
-    :param monkeypatch: Pins ``sys.platform`` to ``darwin`` so the metrics-only argv is asserted.
+    :param monkeypatch: Pins ``sys.platform`` to ``darwin``.
     :param predictions_tree: ``tmp_path`` with ``predictions/`` + ``audio/`` pre-created.
     :param captured_argv: Captured argv list populated by the fixture.
     """
     monkeypatch.setattr(eval_mod.sys, "platform", "darwin")
-    cfg = _build_postprocess_cfg(
-        predictions_tree,
-        render_vst=False,
-        compute_metrics=True,
-        shuffle_pred_audio=False,
-    )
+    cfg = _build_postprocess_cfg(predictions_tree, render_vst=False, compute_metrics=True)
 
     _run_predict_postprocessing(cfg)
 
     metrics_argv = captured_argv[0]
-    assert "--shuffle_pred_audio" not in metrics_argv
-    assert "--shuffle_seed" not in metrics_argv
+    assert "--shuffle_seed" in metrics_argv
+    seed_idx = metrics_argv.index("--shuffle_seed")
+    assert metrics_argv[seed_idx + 1] == "0"
 
 
-def test_postprocessing_shuffle_without_compute_metrics_is_noop(
+def test_postprocessing_compute_metrics_off_fires_no_subprocess(
     predictions_tree: Path,
     captured_argv: list[list[str]],
 ) -> None:
-    """``shuffle_pred_audio`` has no effect unless ``compute_metrics`` is also enabled.
+    """No subprocess fires when ``compute_metrics`` is off regardless of other settings.
 
     :param predictions_tree: ``tmp_path`` with ``predictions/`` + ``audio/`` pre-created.
     :param captured_argv: Captured argv list — asserted empty (no subprocess fires).
@@ -406,7 +403,6 @@ def test_postprocessing_shuffle_without_compute_metrics_is_noop(
         predictions_tree,
         render_vst=False,
         compute_metrics=False,
-        shuffle_pred_audio=True,
         render=None,
     )
 
@@ -529,6 +525,42 @@ def test_postprocessing_returns_loaded_audio_metrics(
     result = _run_predict_postprocessing(cfg)
 
     assert result == _EXPECTED_AUDIO_METRICS
+
+
+def test_postprocessing_returns_shuffled_audio_metrics_when_subprocess_writes_shuffled_csv(
+    monkeypatch: pytest.MonkeyPatch,
+    predictions_tree: Path,
+) -> None:
+    """``shuffled_audio/*`` keys are returned when the metrics subprocess writes both CSVs.
+
+    Verifies the ``_load_audio_metrics`` shuffled-CSV branch is wired through
+    ``_run_predict_postprocessing``; deleting that branch would cause this test to fail.
+
+    :param monkeypatch: Replaces ``subprocess.run`` with a fake that writes both
+        ``aggregated_metrics.csv`` and ``aggregated_metrics_shuffled.csv``.
+    :param predictions_tree: ``tmp_path`` with ``predictions/`` + ``audio/`` pre-created.
+    """
+    metrics_dir = predictions_tree / "metrics"
+
+    def _writes_both_csvs(args: list[str], **_kwargs: object) -> None:
+        if _COMPUTE_AUDIO_METRICS_MODULE not in args:
+            return
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        (metrics_dir / "aggregated_metrics.csv").write_text(_AGGREGATED_METRICS_CSV)
+        (metrics_dir / "aggregated_metrics_shuffled.csv").write_text(
+            _AGGREGATED_METRICS_SHUFFLED_CSV
+        )
+
+    monkeypatch.setattr(eval_mod.subprocess, "run", _writes_both_csvs)
+    cfg = _build_postprocess_cfg(predictions_tree, render_vst=False, compute_metrics=True)
+
+    result = _run_predict_postprocessing(cfg)
+
+    assert "shuffled_audio/mss_mean" in result
+    assert result["shuffled_audio/mss_mean"] == pytest.approx(0.6)
+    assert result["shuffled_audio/mss_std"] == pytest.approx(0.12)
+    assert "audio/mss_mean" in result
+    assert result["audio/mss_mean"] == pytest.approx(0.5)
 
 
 def test_postprocessing_render_subprocess_nonzero_exit_raises(
