@@ -11,6 +11,8 @@ on:
       - "scripts/**"
       - "pyproject.toml"
       - "codecov.yml"
+      - "agent/hooks/**"
+      - "agent/skills/**"
       - ".github/workflows/test.yml"
   pull_request:
     branches: [main, "release/*", "dev"]
@@ -21,6 +23,8 @@ on:
       - "scripts/**"
       - "pyproject.toml"
       - "codecov.yml"
+      - "agent/hooks/**"
+      - "agent/skills/**"
       - ".github/workflows/test.yml"
 
 jobs:
