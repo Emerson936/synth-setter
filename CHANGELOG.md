@@ -1,6 +1,77 @@
 # CHANGELOG
 
 
+## v8.32.0 (2026-06-09)
+
+### Features
+
+- **training**: Store best checkpoint in R2 and reference it from W&B
+  ([#1572](https://github.com/tinaudio/synth-setter/pull/1572),
+  [`102a3a8`](https://github.com/tinaudio/synth-setter/commit/102a3a818eaf3fe165e3212bc24ba29b346a7606))
+
+`log_model: "all"` made Lightning upload every checkpoint file to W&B, exhausting the 5 GB total
+  storage budget. Disable that (`log_model: False`) and instead, at train end on global-zero, upload
+  only the best checkpoint to an auto-derived `r2://{r2.bucket}/checkpoints/{config_id}/model.ckpt`
+  and have the `model-{config_id}` artifact reference that object as an `s3://` URI — so W&B stores
+  a ~0-byte reference, not the file. The flow is automatic: the `r2` config group is composed into
+  `train.yaml`, and `training.upload_checkpoints_uri` becomes an optional override of the derived
+  target. It degrades to a lineage-only artifact when R2 is unreachable (local CPU / CI) or no
+  checkpoint was written, and only runs when a WandbLogger is present.
+
+The `${wandb:...}` resolver now reads a reference artifact's `s3://` manifest entry, rewrites it to
+  `r2://`, and rclone-downloads the checkpoint from R2 (W&B's native download cannot reach R2's
+  custom endpoint); legacy file-upload artifacts still resolve via native download.
+
+Closes #92
+
+### Internal-Feat
+
+- **ci-automation**: Solidify Claude+Codex hook/skill parity
+  ([#1564](https://github.com/tinaudio/synth-setter/pull/1564),
+  [`e7c9f91`](https://github.com/tinaudio/synth-setter/commit/e7c9f9129c180a851a1b844b2f897b130bc22d7e))
+
+* internal-feat(ci-automation): solidify Claude+Codex hook/skill parity
+
+Phase 1 of the provider-agnostic agent harness (#1561): make the shared agent/ contract verifiably
+  portable between Claude Code and the Codex CLI.
+
+- Run the full bash hook suite (agent/hooks/test.sh) in CI via a stdlib-only tests/infra wrapper,
+  exercised under a simulated Codex skill layout; widen test.yml path filters to trigger on
+  agent/hooks/** changes. - Add has_skill bash tests covering the Claude marketplace, Codex
+  plugin-manifest, and flat ~/.codex/skills layouts plus the absent case. - Add a parity test
+  asserting every agent/skills/* resolves via both the Claude and Codex discovery globs, with a
+  negative control so it can never silently pass on the repo-relative fallback. - Document the
+  per-hook observe-mode/CI-backstop audit in docs/reference/agent-harness-parity.md and a Codex
+  onboarding section in AGENTS.md; map the new doc in doc-map.yaml.
+
+Refs #1561
+
+* internal-fix(ci-automation): guard hook-suite against zero cases; run on skills changes
+
+Addresses Copilot review on #1564: - Parse the PASS/FAIL summary counts instead of
+  substring-matching "FAIL: 0", which a suite that registered zero cases would also satisfy; now
+  require a positive PASS count. - Add agent/skills/** to test.yml push + pull_request path filters
+  so a skill-only change (which the discovery-parity test guards) still triggers the unit/infra
+  suite.
+
+* internal-fix(ci-automation): gate hook-suite wrapper to Linux
+
+The macOS CI cell surfaced 4 pre-existing failures inside agent/hooks/test.sh (GNU timeout/gtimeout
+  absent; /var->/private/var canonicalization breaks the primary-root-from-subdir checks) —
+  unrelated to #1561. The hooks target the Linux devcontainer, and the ubuntu cells run the full
+  104-case suite, so skip the wrapper on non-Linux rather than expand scope to make the suite
+  macOS-clean.
+
+* internal-docs(ci-automation): list all Codex skill-discovery layouts in AGENTS.md
+
+The Harnesses section listed only two of the three Codex layouts that has_skill resolves, omitting
+  ~/.codex/plugins/<marketplace>/skills/<name>. Match the parenthetical to _lib.sh and
+  docs/reference/agent-harness-parity.md so Codex users installing under that layout don't read
+  discovery as broken.
+
+* Update AGENTS.md
+
+
 ## v8.31.0 (2026-06-08)
 
 ### Automation
